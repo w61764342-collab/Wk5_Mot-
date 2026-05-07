@@ -10,7 +10,7 @@ from urllib.parse import urljoin, urlparse
 import boto3
 import pandas as pd
 import requests
-from boto3 import Config
+from botocore.config import Config
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.motorgy.com"
