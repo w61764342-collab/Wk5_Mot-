@@ -1,0 +1,29 @@
+name: Scrape Motorgy Test (Single Page)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET_NAME }}
+      REQUEST_DELAY_SECONDS: "1.0"
+      START_PAGE: "1"
+      END_PAGE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: python src/scrape_motorgy.py

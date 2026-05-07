@@ -1,0 +1,88 @@
+name: Scrape Motorgy Monthly (Dynamic) — Cloudflare R2
+
+on:
+  schedule:
+    - cron: "0 1 1 * *"  # Monthly on the 1st at 1 AM UTC
+  workflow_dispatch:
+    inputs:
+      num_parts:
+        description: 'Number of parts to divide scraping into'
+        required: false
+        default: '4'
+        type: string
+
+jobs:
+  detect-pages:
+    name: Detect Total Pages
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.get-ranges.outputs.matrix }}
+      total_pages: ${{ steps.get-ranges.outputs.total_pages }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: Get page ranges
+        id: get-ranges
+        run: |
+          NUM_PARTS="${{ github.event.inputs.num_parts || '4' }}"
+          OUTPUT=$(python CF/get_page_ranges.py "$NUM_PARTS")
+          echo "Raw output: $OUTPUT"
+          
+          # Extract values from JSON
+          TOTAL_PAGES=$(echo "$OUTPUT" | jq -r '.total_pages')
+          RANGES=$(echo "$OUTPUT" | jq -c '.ranges')
+          
+          echo "total_pages=$TOTAL_PAGES" >> $GITHUB_OUTPUT
+          echo "matrix={\"include\":$RANGES}" >> $GITHUB_OUTPUT
+          
+          echo "Total pages: $TOTAL_PAGES"
+          echo "Matrix: {\"include\":$RANGES}"
+
+  scrape:
+    name: Scrape Part ${{ matrix.part }}
+    needs: detect-pages
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-pages.outputs.matrix) }}
+    env:
+      CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+      CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+      CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+      CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+      REQUEST_DELAY_SECONDS: "1.0"
+      START_PAGE: ${{ matrix.start_page }}
+      END_PAGE: ${{ matrix.end_page }}
+      PART_LABEL: ${{ matrix.part }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper (Part ${{ matrix.part }})
+        run: |
+          echo "Scraping pages ${{ matrix.start_page }}-${{ matrix.end_page }} (Part ${{ matrix.part }})"
+          python CF/scrape_motorgy.py
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Part ${{ matrix.part }} Complete ✓" >> $GITHUB_STEP_SUMMARY
+          echo "- Pages scraped: ${{ matrix.start_page }}-${{ matrix.end_page }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Total pages in part: ${{ matrix.total_pages_in_part }}" >> $GITHUB_STEP_SUMMARY
