@@ -45,19 +45,19 @@ jobs:
               endpoint_url=endpoint,
               aws_access_key_id=access_key,
               aws_secret_access_key=secret_key,
-              config=Config(signature_version="s3v4"),
+              config=Config(
+                  signature_version="s3v4",
+                  s3={"addressing_style": "path"},
+              ),
               region_name="auto",
           )
 
           try:
-              response = client.head_bucket(Bucket=bucket)
+              response = client.list_objects_v2(Bucket=bucket, MaxKeys=1)
+              count = response.get("KeyCount", 0)
               print("✅  Connection successful — bucket is accessible.")
-              print(f"HTTP status: {response['ResponseMetadata']['HTTPStatusCode']}")
-          except client.exceptions.ClientError as e:
-              code = e.response["Error"]["Code"]
-              print(f"❌  Connection failed — {code}: {e}")
-              sys.exit(1)
+              print(f"Objects found (sample up to 1): {count}")
           except Exception as e:
-              print(f"❌  Unexpected error: {e}")
+              print(f"❌  Connection failed: {e}")
               sys.exit(1)
           EOF
