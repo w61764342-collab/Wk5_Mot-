@@ -6,39 +6,24 @@ on:
       - "Scrape Motorgy Monthly (Dynamic) — Cloudflare R2"
     types:
       - completed
-  schedule:
-    - cron: "0 8 * * 1-6"
-    - cron: "0 9 * * 0"
-  workflow_dispatch:    inputs:
+  workflow_dispatch:
+    inputs:
       date:
-        description: "Target date YYYY-MM-DD (default yesterday UTC)"
+        description: "Target date YYYY-MM-DD (default today UTC)"
         required: false
         type: string
-      update_stats:
-        description: "Update monitor_stats.yml in R2"
-        required: false
-        default: false
-        type: boolean
-      days_lookback:
-        description: "Number of days to inspect"
-        required: false
-        default: "1"
-        type: string
-      quality_checks:
-        description: "Run pandas data-quality checks"
-        required: false
-        default: false
-        type: boolean
       fail_on_error:
         description: "Exit 1 if any check fails"
         required: false
-        default: false
+        default: true
         type: boolean
 
 jobs:
-  post-scrape-validation:
-    name: Post-Scrape R2 Validation
-    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'cancelled'
+  validate:
+    name: Validate R2 Excel Schema
+    if: |
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'cancelled') ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
@@ -49,7 +34,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -59,73 +44,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyyaml
 
-      - name: Validate R2 Excel files after scrape
+      - name: Validate R2 Excel files
         run: |
-          RUN_DATE=$(date -u +%Y-%m-%d)
-          echo "Post-scrape validation for date: $RUN_DATE"
-          echo "Triggered by workflow: ${{ github.event.workflow_run.name }} (#${{ github.event.workflow_run.run_number }})"
-          python monitor/inspect_r2_schema.py --date "$RUN_DATE" --quality --fail-on-error
-
-  daily-check:    name: Daily R2 Validation
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * 1-6'
-    runs-on: ubuntu-latest
-    env:
-      CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
-      CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
-      CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
-      CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt pyyaml
-
-      - name: Run daily validation
-        run: |
-          FLAGS=""
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            FLAGS="$FLAGS --date ${{ github.event.inputs.date }}"
+          RUN_DATE="${{ github.event.inputs.date }}"
+          if [ -z "$RUN_DATE" ]; then
+            RUN_DATE=$(date -u +%Y-%m-%d)
           fi
-          if [ "${{ github.event.inputs.update_stats }}" = "true" ]; then
-            FLAGS="$FLAGS --update-stats"
-          fi
-          if [ -n "${{ github.event.inputs.days_lookback }}" ]; then
-            FLAGS="$FLAGS --days-lookback ${{ github.event.inputs.days_lookback }}"
-          fi
-          if [ "${{ github.event.inputs.quality_checks }}" = "true" ]; then
-            FLAGS="$FLAGS --quality"
-          fi
-          if [ "${{ github.event.inputs.fail_on_error }}" = "true" ]; then
+          FLAGS="--date $RUN_DATE --quality"
+          if [ "${{ github.event.inputs.fail_on_error }}" != "false" ]; then
             FLAGS="$FLAGS --fail-on-error"
           fi
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "Post-scrape validation for date: $RUN_DATE"
+            echo "Triggered by: ${{ github.event.workflow_run.name }} (#${{ github.event.workflow_run.run_number }})"
+          else
+            echo "Manual validation for date: $RUN_DATE"
+          fi
           python monitor/inspect_r2_schema.py $FLAGS
-
-  weekly-stats:
-    name: Weekly Stats Refresh
-    if: github.event_name == 'schedule' && github.event.schedule == '0 9 * * 0'
-    runs-on: ubuntu-latest
-    env:
-      CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
-      CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
-      CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
-      CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt pyyaml
-
-      - name: Run weekly stats refresh
-        run: python monitor/inspect_r2_schema.py --days-lookback 7 --update-stats --quality

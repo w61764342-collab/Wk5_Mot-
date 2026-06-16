@@ -383,8 +383,8 @@ def print_summary_table(results: dict) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate Motorgy Excel files in R2")
-    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-    parser.add_argument("--date", default=yesterday, help="Target date YYYY-MM-DD (UTC)")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    parser.add_argument("--date", default=today, help="Target date YYYY-MM-DD (UTC, default today)")
     parser.add_argument("--days-lookback", type=int, default=1, help="Number of days to inspect")
     parser.add_argument("--update-stats", action="store_true", help="Merge observations into monitor_stats.yml in R2")
     parser.add_argument("--quality", action="store_true", help="Run pandas data-quality checks")
