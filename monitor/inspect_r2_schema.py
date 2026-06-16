@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
+import numpy as np
 import pandas as pd
 import yaml
 from botocore.config import Config
@@ -24,6 +25,23 @@ LOCAL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "we
 MONITOR_STATS_KEY = "monitor/monitor_stats.yml"
 CONFIG_KEY = "monitor/websites-config.yml"
 DEFAULT_CONFIG_BASE = "motorgy"
+
+
+def json_safe(value: Any) -> Any:
+    """Convert numpy/pandas scalars to native Python types for JSON serialization."""
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
 
 
 def get_env(name: str) -> str:
@@ -195,6 +213,7 @@ def validate_file(
 
     def add_check(name: str, passed: bool, detail: str, severity: str = "critical") -> None:
         nonlocal all_passed
+        passed = bool(passed)
         if not passed:
             all_passed = False
         checks.append({"check": name, "passed": passed, "detail": detail, "severity": severity})
@@ -270,20 +289,22 @@ def run_quality_checks(content: bytes, sheet_name: str = "Sheet1") -> List[dict]
     df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name)
 
     def add(name: str, passed: bool, detail: str) -> None:
-        checks.append({"check": name, "passed": passed, "detail": detail, "severity": "medium"})
+        checks.append(
+            {"check": name, "passed": bool(passed), "detail": detail, "severity": "medium"}
+        )
 
     if "ad_id" in df.columns:
-        null_pct = df["ad_id"].isna().mean() * 100
+        null_pct = float(df["ad_id"].isna().mean() * 100)
         add("null_ad_id_pct", null_pct < 5, f"{null_pct:.1f}% null ad_id values")
         dupes = int(df["ad_id"].duplicated().sum())
         add("duplicate_ad_id", dupes == 0, f"{dupes} duplicate ad_id values")
 
     if "title" in df.columns:
-        null_pct = df["title"].isna().mean() * 100
+        null_pct = float(df["title"].isna().mean() * 100)
         add("null_title_pct", null_pct < 10, f"{null_pct:.1f}% null title values")
 
     if "price" in df.columns:
-        null_pct = df["price"].isna().mean() * 100
+        null_pct = float(df["price"].isna().mean() * 100)
         add("null_price_pct", null_pct < 20, f"{null_pct:.1f}% null price values")
 
     return checks
@@ -522,10 +543,10 @@ def main() -> int:
                 {
                     "key": item["key"],
                     "filename": item["filename"],
-                    "size_bytes": item["size_bytes"],
+                    "size_bytes": int(item["size_bytes"]),
                     "sheets": item["inspection"].get("sheets", {}),
                     "checks": checks,
-                    "all_passed": file_passed,
+                    "all_passed": bool(file_passed),
                 }
             )
             stat_observations.append(
@@ -567,7 +588,7 @@ def main() -> int:
         client,
         bucket,
         report_key,
-        json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8"),
+        json.dumps(json_safe(report), indent=2, ensure_ascii=False).encode("utf-8"),
         "application/json",
     )
     print(f"Report uploaded to r2://{bucket}/{report_key}")
