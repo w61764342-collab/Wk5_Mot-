@@ -25,6 +25,7 @@ LOCAL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "we
 MONITOR_STATS_KEY = "monitor/monitor_stats.yml"
 CONFIG_KEY = "monitor/websites-config.yml"
 DEFAULT_CONFIG_BASE = "motorgy"
+DEFAULT_DYNAMIC_COLUMN_PATTERNS = ["inspection_*__*"]
 
 
 def json_safe(value: Any) -> Any:
@@ -129,6 +130,105 @@ def inspect_workbook(content: bytes) -> Dict[str, Any]:
     return {"sheets": sheets}
 
 
+def classify_columns(
+    columns: List[str],
+    sheet_schema: dict,
+    known_union: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Split columns into required, dynamic, and unexpected groups."""
+    required = sheet_schema.get("required_columns", [])
+    required_set = set(required)
+    patterns = sheet_schema.get("dynamic_column_patterns", DEFAULT_DYNAMIC_COLUMN_PATTERNS)
+    actual = list(columns)
+
+    dynamic = [
+        col
+        for col in actual
+        if col not in required_set
+        and any(fnmatch.fnmatch(col, pattern) for pattern in patterns)
+    ]
+    dynamic_set = set(dynamic)
+    unknown = [col for col in actual if col not in required_set and col not in dynamic_set]
+    missing_required = [col for col in required if col not in actual]
+
+    union_set = set(known_union or [])
+    new_columns = [col for col in actual if union_set and col not in union_set]
+    dropped_from_union = [col for col in union_set if col not in actual] if union_set else []
+
+    return {
+        "total_columns": len(actual),
+        "required_count": len(required_set & set(actual)),
+        "dynamic_count": len(dynamic),
+        "columns": sorted(actual),
+        "required_columns": sorted(required_set & set(actual)),
+        "missing_required": sorted(missing_required),
+        "dynamic_columns": sorted(dynamic),
+        "unknown_columns": sorted(unknown),
+        "new_columns": sorted(new_columns),
+        "dropped_from_union": sorted(dropped_from_union),
+        "dynamic_column_patterns": patterns,
+    }
+
+
+def validate_column_schema(
+    actual_cols: List[str],
+    sheet_schema: dict,
+    known_union: List[str],
+) -> Tuple[List[dict], Dict[str, Any]]:
+    """Validate and describe the column schema for one sheet."""
+    checks: List[dict] = []
+    schema = classify_columns(actual_cols, sheet_schema, known_union)
+    patterns = schema["dynamic_column_patterns"]
+
+    missing = schema["missing_required"]
+    checks.append(
+        {
+            "check": "required_columns",
+            "passed": len(missing) == 0,
+            "detail": (
+                f"Missing required columns: {missing}"
+                if missing
+                else f"All {len(sheet_schema.get('required_columns', []))} required columns present"
+            ),
+            "severity": "critical",
+        }
+    )
+
+    unknown = schema["unknown_columns"]
+    checks.append(
+        {
+            "check": "column_schema",
+            "passed": len(unknown) == 0,
+            "detail": (
+                f"Unexpected columns outside schema: {unknown}"
+                if unknown
+                else (
+                    f"Column schema OK — {schema['required_count']} required, "
+                    f"{schema['dynamic_count']} dynamic ({', '.join(patterns)})"
+                )
+            ),
+            "severity": "high",
+        }
+    )
+
+    if known_union:
+        dropped = schema["dropped_from_union"]
+        checks.append(
+            {
+                "check": "column_union",
+                "passed": len(dropped) == 0,
+                "detail": (
+                    f"Columns missing vs R2 history: {dropped}"
+                    if dropped
+                    else f"All {len(known_union)} known columns present"
+                ),
+                "severity": "medium",
+            }
+        )
+
+    return checks, schema
+
+
 def expand_file_pattern(pattern: str, target_date: datetime) -> str:
     """Replace template placeholders before fnmatch (matches CF/scrape_motorgy.py naming)."""
     return (
@@ -217,7 +317,7 @@ def validate_file(
     peer_row_counts: List[int],
     peer_sizes_kb: List[float],
     target_date: datetime,
-) -> Tuple[List[dict], bool]:
+) -> Tuple[List[dict], bool, Dict[str, Any]]:
     checks: List[dict] = []
     all_passed = True
 
@@ -252,6 +352,8 @@ def validate_file(
 
     sheet_schemas = {s["name"]: s for s in schema_entry.get("sheets", [])}
     actual_sheets = inspection.get("sheets", {})
+    column_schema_summary: Dict[str, Any] = {}
+    known_union = stats.get(scraper_name, {}).get("column_union", [])
 
     for sheet_name, sheet_schema in sheet_schemas.items():
         if sheet_name not in actual_sheets:
@@ -265,14 +367,18 @@ def validate_file(
         add_check("sheet_exists", True, f"Sheet '{sheet_name}' present")
 
         actual = actual_sheets[sheet_name]
-        required = sheet_schema.get("required_columns", [])
         actual_cols = actual.get("columns", [])
-        missing = [col for col in required if col not in actual_cols]
-        add_check(
-            "required_columns",
-            len(missing) == 0,
-            f"Missing columns: {missing}" if missing else f"All {len(required)} required columns present",
+        column_checks, column_schema = validate_column_schema(
+            actual_cols, sheet_schema, known_union
         )
+        column_schema_summary[sheet_name] = column_schema
+        for check in column_checks:
+            add_check(
+                check["check"],
+                check["passed"],
+                check["detail"],
+                severity=check.get("severity", "critical"),
+            )
 
         part_key = normalize_part_key(filename)
         row_min, row_max, row_source = resolve_row_range(
@@ -292,7 +398,7 @@ def validate_file(
             severity="high" if not in_range else "critical",
         )
 
-    return checks, all_passed
+    return checks, all_passed, column_schema_summary
 
 
 def run_quality_checks(content: bytes, sheet_name: str = "Sheet1") -> List[dict]:
@@ -332,7 +438,12 @@ def load_existing_stats(client, bucket: str, base_path: str) -> dict:
         raise
 
 
-def merge_stats(existing: dict, scraper_name: str, observations: List[dict]) -> dict:
+def merge_stats(
+    existing: dict,
+    scraper_name: str,
+    observations: List[dict],
+    schema_entry: Optional[dict] = None,
+) -> dict:
     stats = dict(existing)
     scraper_stats = stats.setdefault(scraper_name, {"parts": {}, "column_union": []})
     column_union = set(scraper_stats.get("column_union", []))
@@ -356,6 +467,25 @@ def merge_stats(existing: dict, scraper_name: str, observations: List[dict]) -> 
             column_union.update(sheet_data.get("columns", []))
 
     scraper_stats["column_union"] = sorted(column_union)
+    sheet_schema = (schema_entry or {}).get("sheets", [{}])[0]
+    patterns = sheet_schema.get("dynamic_column_patterns", DEFAULT_DYNAMIC_COLUMN_PATTERNS)
+    required_cols = sheet_schema.get("required_columns", [])
+    scraper_stats["column_schema"] = {
+        "required_columns": required_cols,
+        "dynamic_column_patterns": patterns,
+        "observed_union": sorted(column_union),
+        "observed_required_count": len([c for c in column_union if c in required_cols]),
+        "observed_dynamic_count": len(
+            [
+                c
+                for c in column_union
+                if c not in required_cols
+                and any(fnmatch.fnmatch(c, p) for p in patterns)
+            ]
+        ),
+        "total_observed": len(column_union),
+        "last_seen": observations[-1].get("date") if observations else None,
+    }
     stats[scraper_name] = scraper_stats
     return stats
 
@@ -383,6 +513,37 @@ def collect_failures(results: dict) -> List[dict]:
                     }
                 )
     return failures
+
+
+def print_column_schema_report(scraper_name: str, scraper_result: dict) -> None:
+    summary = scraper_result.get("column_schema_summary")
+    if not summary:
+        return
+
+    print(f"\nColumn schema — {scraper_name}:")
+    for sheet_name, sheet_summary in summary.items():
+        print(f"  Sheet: {sheet_name}")
+        print(f"    Total columns: {sheet_summary.get('total_columns', 0)}")
+        print(
+            f"    Required: {sheet_summary.get('required_count', 0)} | "
+            f"Dynamic: {sheet_summary.get('dynamic_count', 0)} | "
+            f"Patterns: {', '.join(sheet_summary.get('dynamic_column_patterns', []))}"
+        )
+        if sheet_summary.get("dynamic_columns"):
+            dynamic_preview = sheet_summary["dynamic_columns"][:5]
+            suffix = " ..." if len(sheet_summary["dynamic_columns"]) > 5 else ""
+            print(f"    Dynamic columns: {', '.join(dynamic_preview)}{suffix}")
+        if sheet_summary.get("unknown_columns"):
+            print(f"    Unexpected: {sheet_summary['unknown_columns']}")
+        if sheet_summary.get("new_columns"):
+            print(f"    New vs history: {sheet_summary['new_columns']}")
+        if sheet_summary.get("dropped_from_union"):
+            print(f"    Dropped vs history: {sheet_summary['dropped_from_union']}")
+
+    consistency = scraper_result.get("column_consistency")
+    if consistency:
+        status = "PASS" if consistency.get("passed") else "FAIL"
+        print(f"  Cross-part column consistency: {status} — {consistency.get('detail')}")
 
 
 def print_file_inventory(scraper_name: str, pending_files: List[dict]) -> None:
@@ -476,6 +637,26 @@ def write_step_summary(results: dict) -> None:
                     f"`{check['check']}`: {check['detail']}"
                 )
             lines.append("")
+
+    for scraper in results.get("scrapers", []):
+        summary = scraper.get("column_schema_summary")
+        if not summary:
+            continue
+        lines.extend(["", f"### Column schema — {scraper['name']}", ""])
+        for sheet_name, sheet_summary in summary.items():
+            lines.append(
+                f"**{sheet_name}**: {sheet_summary.get('total_columns', 0)} columns "
+                f"({sheet_summary.get('required_count', 0)} required, "
+                f"{sheet_summary.get('dynamic_count', 0)} dynamic)"
+            )
+            if sheet_summary.get("dynamic_columns"):
+                preview = ", ".join(sheet_summary["dynamic_columns"][:8])
+                if len(sheet_summary["dynamic_columns"]) > 8:
+                    preview += ", …"
+                lines.append(f"- Dynamic: `{preview}`")
+        consistency = scraper.get("column_consistency")
+        if consistency:
+            lines.append(f"- Cross-part consistency: {consistency.get('detail')}")
 
     failures = collect_failures(results)
     if failures:
@@ -629,9 +810,12 @@ def main() -> int:
             for sheet in item["inspection"].get("sheets", {}).values()
         ]
         peer_sizes_kb = [item["size_bytes"] / 1024 for item in pending_files]
+        known_union = stats_merged.get(scraper_name, {}).get("column_union", [])
+        sheet_schema = schema_entry.get("sheets", [{}])[0]
+        primary_sheet = sheet_schema.get("name", "Sheet1")
 
         for item in pending_files:
-            checks, file_passed = validate_file(
+            checks, file_passed, file_column_schema = validate_file(
                 item["filename"],
                 item["size_bytes"],
                 item["inspection"],
@@ -664,6 +848,7 @@ def main() -> int:
                     "filename": item["filename"],
                     "size_bytes": int(item["size_bytes"]),
                     "sheets": item["inspection"].get("sheets", {}),
+                    "column_schema": file_column_schema,
                     "checks": checks,
                     "all_passed": bool(file_passed),
                 }
@@ -676,6 +861,49 @@ def main() -> int:
                     "sheets": item["inspection"].get("sheets", {}),
                 }
             )
+
+        if pending_files:
+            all_columns: List[str] = []
+            column_sets: Dict[tuple, List[str]] = {}
+            for item in pending_files:
+                cols = item["inspection"]["sheets"].get(primary_sheet, {}).get("columns", [])
+                all_columns.extend(col for col in cols if col not in all_columns)
+                column_sets.setdefault(tuple(cols), []).append(item["filename"])
+
+            scraper_result["column_schema_summary"] = {
+                primary_sheet: classify_columns(all_columns, sheet_schema, known_union)
+            }
+
+            consistency_ok = len(column_sets) <= 1
+            if consistency_ok:
+                consistency_detail = (
+                    f"All {len(pending_files)} parts share "
+                    f"{len(all_columns)} columns on '{primary_sheet}'"
+                )
+            else:
+                mismatches = [
+                    f"{files[0]} ({len(cols)} cols)"
+                    for cols, files in column_sets.items()
+                ]
+                consistency_detail = (
+                    f"{len(column_sets)} different column sets across parts: "
+                    f"{'; '.join(mismatches)}"
+                )
+            scraper_result["column_consistency"] = {
+                "passed": consistency_ok,
+                "detail": consistency_detail,
+            }
+            if len(pending_files) > 1:
+                scraper_result["checks_total"] += 1
+                scraper_result["checks_passed"] += int(consistency_ok)
+                if not consistency_ok:
+                    scraper_result["all_passed"] = False
+                    any_failure = True
+                    print(f"  FAIL (column consistency): {consistency_detail}")
+                else:
+                    print(f"  PASS (column consistency): {consistency_detail}")
+
+            print_column_schema_report(scraper_name, scraper_result)
 
         if scraper_result["files_found"] == 0:
             scraper_result["all_passed"] = False
@@ -700,7 +928,9 @@ def main() -> int:
         report["scrapers"].append(scraper_result)
 
         if stat_observations:
-            stats_merged = merge_stats(stats_merged, scraper_name, stat_observations)
+            stats_merged = merge_stats(
+                stats_merged, scraper_name, stat_observations, schema_entry
+            )
 
     report_key = f"{report_base}/monitor/{args.date}/report.json"
     upload_bytes(
