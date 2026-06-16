@@ -1,11 +1,15 @@
 name: R2 Excel Schema Monitor
 
 on:
+  workflow_run:
+    workflows:
+      - "Scrape Motorgy Monthly (Dynamic) — Cloudflare R2"
+    types:
+      - completed
   schedule:
     - cron: "0 8 * * 1-6"
     - cron: "0 9 * * 0"
-  workflow_dispatch:
-    inputs:
+  workflow_dispatch:    inputs:
       date:
         description: "Target date YYYY-MM-DD (default yesterday UTC)"
         required: false
@@ -32,8 +36,37 @@ on:
         type: boolean
 
 jobs:
-  daily-check:
-    name: Daily R2 Validation
+  post-scrape-validation:
+    name: Post-Scrape R2 Validation
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    env:
+      CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+      CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+      CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+      CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyyaml
+
+      - name: Validate R2 Excel files after scrape
+        run: |
+          RUN_DATE=$(date -u +%Y-%m-%d)
+          echo "Post-scrape validation for date: $RUN_DATE"
+          echo "Triggered by workflow: ${{ github.event.workflow_run.name }} (#${{ github.event.workflow_run.run_number }})"
+          python monitor/inspect_r2_schema.py --date "$RUN_DATE" --quality --fail-on-error
+
+  daily-check:    name: Daily R2 Validation
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * 1-6'
     runs-on: ubuntu-latest
     env:
