@@ -129,8 +129,17 @@ def inspect_workbook(content: bytes) -> Dict[str, Any]:
     return {"sheets": sheets}
 
 
-def matches_file_pattern(filename: str, pattern: str) -> bool:
-    return fnmatch.fnmatch(filename, pattern)
+def expand_file_pattern(pattern: str, target_date: datetime) -> str:
+    """Replace template placeholders before fnmatch (matches CF/scrape_motorgy.py naming)."""
+    return (
+        pattern.replace("{date}", target_date.strftime("%Y%m%d"))
+        .replace("{date_dash}", target_date.strftime("%Y-%m-%d"))
+    )
+
+
+def matches_file_pattern(filename: str, pattern: str, target_date: Optional[datetime] = None) -> bool:
+    resolved = expand_file_pattern(pattern, target_date) if target_date else pattern
+    return fnmatch.fnmatch(filename, resolved)
 
 
 def normalize_part_key(filename: str) -> str:
@@ -207,6 +216,7 @@ def validate_file(
     stats: dict,
     peer_row_counts: List[int],
     peer_sizes_kb: List[float],
+    target_date: datetime,
 ) -> Tuple[List[dict], bool]:
     checks: List[dict] = []
     all_passed = True
@@ -218,10 +228,11 @@ def validate_file(
             all_passed = False
         checks.append({"check": name, "passed": passed, "detail": detail, "severity": severity})
 
-    pattern = schema_entry.get("excel_file_pattern", "*.xlsx")
+    raw_pattern = schema_entry.get("excel_file_pattern", "*.xlsx")
+    pattern = expand_file_pattern(raw_pattern, target_date)
     add_check(
         "file_pattern",
-        matches_file_pattern(filename, pattern),
+        matches_file_pattern(filename, raw_pattern, target_date),
         f"Pattern '{pattern}' vs '{filename}'",
     )
 
@@ -629,6 +640,7 @@ def main() -> int:
                 stats_merged,
                 peer_row_counts,
                 peer_sizes_kb,
+                item["day"],
             )
 
             if args.quality:
