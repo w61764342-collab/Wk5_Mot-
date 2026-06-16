@@ -1,0 +1,10 @@
+output/
+.venv/
+__pycache__/
+*.pyc
+monitor_stats.yml
+monitor/report_*.json
+monitor.md
+websites-config.yml
+prompts/excel-schema-prompt.md
+prompts/monitor-prompt.md

@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""Validate Motorgy Excel files uploaded to Cloudflare R2 against websites-config.yml schema."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import io
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
+import pandas as pd
+import yaml
+from botocore.config import Config
+from botocore.exceptions import ClientError
+from openpyxl import load_workbook
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "websites-config.yml")
+MONITOR_STATS_KEY = "monitor/monitor_stats.yml"
+
+
+def get_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def build_r2_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=get_env("CF_R2_ENDPOINT_URL"),
+        aws_access_key_id=get_env("CF_R2_ACCESS_KEY_ID"),
+        aws_secret_access_key=get_env("CF_R2_SECRET_ACCESS_KEY"),
+        region_name="us-east-1",
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH, encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def strip_bucket_placeholder(r2_path: str) -> str:
+    return re.sub(r"^\{bucket\}/?", "", r2_path).rstrip("/")
+
+
+def date_partition_prefix(base_path: str, target_date: datetime) -> str:
+    return (
+        f"{base_path}/year={target_date.strftime('%Y')}"
+        f"/month={target_date.strftime('%m')}"
+        f"/day={target_date.strftime('%d')}"
+    )
+
+
+def list_xlsx_objects(client, bucket: str, prefix: str) -> List[dict]:
+    objects: List[dict] = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.lower().endswith(".xlsx"):
+                objects.append(obj)
+    return objects
+
+
+def download_object(client, bucket: str, key: str) -> bytes:
+    response = client.get_object(Bucket=bucket, Key=key)
+    return response["Body"].read()
+
+
+def inspect_workbook(content: bytes) -> Dict[str, Any]:
+    wb = load_workbook(filename=io.BytesIO(content), read_only=True, data_only=True)
+    sheets: Dict[str, Any] = {}
+    try:
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = ws.iter_rows(min_row=1, max_row=1, values_only=True)
+            headers = [str(cell).strip() if cell is not None else "" for cell in next(rows, ())]
+            data_rows = max(ws.max_row - 1, 0) if ws.max_row else 0
+            sheets[sheet_name] = {"columns": headers, "row_count": data_rows}
+    finally:
+        wb.close()
+    return {"sheets": sheets}
+
+
+def matches_file_pattern(filename: str, pattern: str) -> bool:
+    return fnmatch.fnmatch(filename, pattern)
+
+
+def normalize_part_key(filename: str) -> str:
+    match = re.search(r"_part-([^./]+)", filename, re.IGNORECASE)
+    if match:
+        return f"part-{match.group(1)}"
+    return re.sub(r"_\d{8}", "_DATE", filename)
+
+
+def resolve_row_range(
+    part_key: str,
+    sheet_name: str,
+    scraper_name: str,
+    stats: dict,
+    peer_row_counts: List[int],
+) -> Tuple[int, Optional[int], str]:
+    """Derive acceptable row range from R2 historical stats or same-run peers."""
+    part_stats = (
+        stats.get(scraper_name, {})
+        .get("parts", {})
+        .get(part_key, {})
+        .get(sheet_name, {})
+    )
+
+    if part_stats.get("min_rows") is not None and part_stats.get("max_rows") is not None:
+        min_rows = max(1, int(part_stats["min_rows"] * 0.8))
+        max_rows = max(min_rows, int(part_stats["max_rows"] * 1.2))
+        return min_rows, max_rows, "r2_historical_stats"
+
+    non_zero_peers = [count for count in peer_row_counts if count > 0]
+    if len(non_zero_peers) >= 2:
+        peer_min = min(non_zero_peers)
+        peer_max = max(non_zero_peers)
+        min_rows = max(1, int(peer_min * 0.7))
+        max_rows = max(min_rows, int(peer_max * 1.3))
+        return min_rows, max_rows, "same_run_peers"
+
+    if len(non_zero_peers) == 1:
+        return 1, None, "single_file_baseline"
+
+    return 1, None, "no_baseline"
+
+
+def resolve_min_size_kb(
+    part_key: str,
+    sheet_name: str,
+    scraper_name: str,
+    stats: dict,
+    peer_sizes_kb: List[float],
+) -> Tuple[float, str]:
+    part_stats = (
+        stats.get(scraper_name, {})
+        .get("parts", {})
+        .get(part_key, {})
+        .get(sheet_name, {})
+    )
+
+    if part_stats.get("min_size_kb") is not None:
+        return max(1.0, float(part_stats["min_size_kb"]) * 0.8), "r2_historical_stats"
+
+    non_zero_peers = [size for size in peer_sizes_kb if size > 0]
+    if non_zero_peers:
+        return max(1.0, min(non_zero_peers) * 0.5), "same_run_peers"
+
+    return 1.0, "no_baseline"
+
+
+def validate_file(
+    filename: str,
+    file_size_bytes: int,
+    inspection: Dict[str, Any],
+    schema_entry: dict,
+    scraper_name: str,
+    stats: dict,
+    peer_row_counts: List[int],
+    peer_sizes_kb: List[float],
+) -> Tuple[List[dict], bool]:
+    checks: List[dict] = []
+    all_passed = True
+
+    def add_check(name: str, passed: bool, detail: str, severity: str = "critical") -> None:
+        nonlocal all_passed
+        if not passed:
+            all_passed = False
+        checks.append({"check": name, "passed": passed, "detail": detail, "severity": severity})
+
+    pattern = schema_entry.get("excel_file_pattern", "*.xlsx")
+    add_check(
+        "file_pattern",
+        matches_file_pattern(filename, pattern),
+        f"Pattern '{pattern}' vs '{filename}'",
+    )
+
+    min_kb, size_source = resolve_min_size_kb(
+        normalize_part_key(filename),
+        next((s["name"] for s in schema_entry.get("sheets", [])), "Sheet1"),
+        scraper_name,
+        stats,
+        peer_sizes_kb,
+    )
+    size_kb = file_size_bytes / 1024
+    add_check(
+        "min_file_size",
+        size_kb >= min_kb,
+        f"Size {size_kb:.1f} KB (min {min_kb:.1f} KB from {size_source})",
+    )
+
+    sheet_schemas = {s["name"]: s for s in schema_entry.get("sheets", [])}
+    actual_sheets = inspection.get("sheets", {})
+
+    for sheet_name, sheet_schema in sheet_schemas.items():
+        if sheet_name not in actual_sheets:
+            add_check(
+                "sheet_exists",
+                False,
+                f"Missing sheet '{sheet_name}' (found: {list(actual_sheets.keys())})",
+            )
+            continue
+
+        add_check("sheet_exists", True, f"Sheet '{sheet_name}' present")
+
+        actual = actual_sheets[sheet_name]
+        required = sheet_schema.get("required_columns", [])
+        actual_cols = actual.get("columns", [])
+        missing = [col for col in required if col not in actual_cols]
+        add_check(
+            "required_columns",
+            len(missing) == 0,
+            f"Missing columns: {missing}" if missing else f"All {len(required)} required columns present",
+        )
+
+        part_key = normalize_part_key(filename)
+        row_min, row_max, row_source = resolve_row_range(
+            part_key, sheet_name, scraper_name, stats, peer_row_counts
+        )
+        row_count = actual.get("row_count", 0)
+        if row_max is None:
+            in_range = row_count >= row_min
+            range_label = f">= {row_min}"
+        else:
+            in_range = row_min <= row_count <= row_max
+            range_label = f"[{row_min}, {row_max}]"
+        add_check(
+            "row_count_range",
+            in_range,
+            f"Row count {row_count} (expected {range_label} from {row_source})",
+            severity="high" if not in_range else "critical",
+        )
+
+    return checks, all_passed
+
+
+def run_quality_checks(content: bytes, sheet_name: str = "Sheet1") -> List[dict]:
+    checks: List[dict] = []
+    df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name)
+
+    def add(name: str, passed: bool, detail: str) -> None:
+        checks.append({"check": name, "passed": passed, "detail": detail, "severity": "medium"})
+
+    if "ad_id" in df.columns:
+        null_pct = df["ad_id"].isna().mean() * 100
+        add("null_ad_id_pct", null_pct < 5, f"{null_pct:.1f}% null ad_id values")
+        dupes = int(df["ad_id"].duplicated().sum())
+        add("duplicate_ad_id", dupes == 0, f"{dupes} duplicate ad_id values")
+
+    if "title" in df.columns:
+        null_pct = df["title"].isna().mean() * 100
+        add("null_title_pct", null_pct < 10, f"{null_pct:.1f}% null title values")
+
+    if "price" in df.columns:
+        null_pct = df["price"].isna().mean() * 100
+        add("null_price_pct", null_pct < 20, f"{null_pct:.1f}% null price values")
+
+    return checks
+
+
+def load_existing_stats(client, bucket: str, base_path: str) -> dict:
+    key = f"{base_path}/{MONITOR_STATS_KEY}"
+    try:
+        body = download_object(client, bucket, key)
+        return yaml.safe_load(body) or {}
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return {}
+        raise
+
+
+def merge_stats(existing: dict, scraper_name: str, observations: List[dict]) -> dict:
+    stats = dict(existing)
+    scraper_stats = stats.setdefault(scraper_name, {"parts": {}, "column_union": []})
+    column_union = set(scraper_stats.get("column_union", []))
+
+    for obs in observations:
+        part_key = normalize_part_key(obs["filename"])
+        part_stats = scraper_stats["parts"].setdefault(part_key, {})
+        size_kb = obs.get("size_bytes", 0) / 1024
+
+        for sheet_name, sheet_data in obs.get("sheets", {}).items():
+            prev = part_stats.get(sheet_name, {})
+            row_count = sheet_data.get("row_count", 0)
+            part_stats[sheet_name] = {
+                "min_rows": min(prev.get("min_rows", row_count), row_count),
+                "max_rows": max(prev.get("max_rows", row_count), row_count),
+                "min_size_kb": min(prev.get("min_size_kb", size_kb), size_kb),
+                "max_size_kb": max(prev.get("max_size_kb", size_kb), size_kb),
+                "last_seen": obs.get("date"),
+                "observations": prev.get("observations", 0) + 1,
+            }
+            column_union.update(sheet_data.get("columns", []))
+
+    scraper_stats["column_union"] = sorted(column_union)
+    stats[scraper_name] = scraper_stats
+    return stats
+
+
+def upload_bytes(client, bucket: str, key: str, content: bytes, content_type: str) -> None:
+    client.put_object(Bucket=bucket, Key=key, Body=content, ContentType=content_type)
+
+
+def write_step_summary(results: dict) -> None:
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+
+    lines = [
+        "## R2 Excel Schema Monitor",
+        "",
+        "| Scraper | Files | Passed | Total checks | Status |",
+        "|---------|-------|--------|--------------|--------|",
+    ]
+    for scraper in results.get("scrapers", []):
+        status = "PASS" if scraper.get("all_passed") else "FAIL"
+        lines.append(
+            f"| {scraper['name']} | {scraper['files_found']} | "
+            f"{scraper['checks_passed']} | {scraper['checks_total']} | {status} |"
+        )
+
+    for scraper in results.get("scrapers", []):
+        if scraper.get("all_passed"):
+            continue
+        lines.extend(["", f"### Failures — {scraper['name']}", ""])
+        for file_result in scraper.get("files", []):
+            failed = [c for c in file_result.get("checks", []) if not c["passed"]]
+            if not failed:
+                continue
+            lines.append(f"**{file_result['filename']}** (`{file_result['key']}`)")
+            for check in failed:
+                lines.append(f"- {check['check']}: {check['detail']}")
+            lines.append("")
+
+    with open(summary_path, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def print_summary_table(results: dict) -> None:
+    print("\nR2 Excel Schema Monitor Summary")
+    print("-" * 72)
+    print(f"{'Scraper':<24} {'Files':>6} {'Passed':>8} {'Total':>8} {'Status':>8}")
+    print("-" * 72)
+    for scraper in results.get("scrapers", []):
+        status = "PASS" if scraper.get("all_passed") else "FAIL"
+        print(
+            f"{scraper['name']:<24} {scraper['files_found']:>6} "
+            f"{scraper['checks_passed']:>8} {scraper['checks_total']:>8} {status:>8}"
+        )
+    print("-" * 72)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate Motorgy Excel files in R2")
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    parser.add_argument("--date", default=yesterday, help="Target date YYYY-MM-DD (UTC)")
+    parser.add_argument("--days-lookback", type=int, default=1, help="Number of days to inspect")
+    parser.add_argument("--update-stats", action="store_true", help="Merge observations into monitor_stats.yml in R2")
+    parser.add_argument("--quality", action="store_true", help="Run pandas data-quality checks")
+    parser.add_argument("--fail-on-error", action="store_true", help="Exit 1 if any check fails")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    config = load_config()
+    bucket = get_env("CF_R2_BUCKET_NAME")
+    client = build_r2_client()
+
+    schema_cfg = {s["scraper"]: s for s in config.get("excel_schema", [])}
+
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "target_dates": [],
+        "scrapers": [],
+    }
+    report_base = strip_bucket_placeholder(config.get("scrapers", [{}])[0].get("r2_path", "motorgy"))
+    stats_merged = load_existing_stats(client, bucket, report_base)
+    any_failure = False
+
+    target_date = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    dates = [target_date - timedelta(days=offset) for offset in range(args.days_lookback)]
+    report["target_dates"] = [d.strftime("%Y-%m-%d") for d in dates]
+
+    for scraper in config.get("scrapers", []):
+        scraper_name = scraper["name"]
+        schema_entry = schema_cfg.get(scraper_name)
+        if not schema_entry:
+            print(f"WARNING: No excel_schema entry for scraper '{scraper_name}'", file=sys.stderr)
+            continue
+
+        base_path = strip_bucket_placeholder(scraper["r2_path"])
+        scraper_result = {
+            "name": scraper_name,
+            "files_found": 0,
+            "checks_passed": 0,
+            "checks_total": 0,
+            "all_passed": True,
+            "files": [],
+        }
+        stat_observations: List[dict] = []
+        pending_files: List[dict] = []
+
+        for day in dates:
+            prefix = date_partition_prefix(base_path, day)
+            objects = list_xlsx_objects(client, bucket, prefix)
+
+            for obj in objects:
+                key = obj["Key"]
+                filename = os.path.basename(key)
+                if "/excel_files/" not in key:
+                    continue
+
+                content = download_object(client, bucket, key)
+                inspection = inspect_workbook(content)
+                pending_files.append(
+                    {
+                        "key": key,
+                        "filename": filename,
+                        "size_bytes": obj["Size"],
+                        "inspection": inspection,
+                        "content": content,
+                        "day": day,
+                    }
+                )
+
+        scraper_result["files_found"] = len(pending_files)
+        known_parts = set(stats_merged.get(scraper_name, {}).get("parts", {}).keys())
+        current_parts = {normalize_part_key(item["filename"]) for item in pending_files}
+        if known_parts:
+            missing_parts = sorted(known_parts - current_parts)
+            parts_ok = len(missing_parts) == 0
+            scraper_result["checks_total"] += 1
+            scraper_result["checks_passed"] += int(parts_ok)
+            if not parts_ok:
+                scraper_result["all_passed"] = False
+                any_failure = True
+            scraper_result["files"].append(
+                {
+                    "key": "",
+                    "filename": "(parts completeness)",
+                    "checks": [
+                        {
+                            "check": "parts_completeness",
+                            "passed": parts_ok,
+                            "detail": (
+                                f"Missing parts: {missing_parts} "
+                                f"(expected {sorted(known_parts)} from R2 history)"
+                                if missing_parts
+                                else f"All {len(known_parts)} known parts present"
+                            ),
+                            "severity": "critical",
+                        }
+                    ],
+                    "all_passed": parts_ok,
+                }
+            )
+
+        peer_row_counts = [
+            sheet.get("row_count", 0)
+            for item in pending_files
+            for sheet in item["inspection"].get("sheets", {}).values()
+        ]
+        peer_sizes_kb = [item["size_bytes"] / 1024 for item in pending_files]
+
+        for item in pending_files:
+            checks, file_passed = validate_file(
+                item["filename"],
+                item["size_bytes"],
+                item["inspection"],
+                schema_entry,
+                scraper_name,
+                stats_merged,
+                peer_row_counts,
+                peer_sizes_kb,
+            )
+
+            if args.quality:
+                quality_checks = run_quality_checks(item["content"])
+                checks.extend(quality_checks)
+                file_passed = file_passed and all(c["passed"] for c in quality_checks)
+
+            scraper_result["checks_total"] += len(checks)
+            scraper_result["checks_passed"] += sum(1 for c in checks if c["passed"])
+            if not file_passed:
+                scraper_result["all_passed"] = False
+                any_failure = True
+
+            scraper_result["files"].append(
+                {
+                    "key": item["key"],
+                    "filename": item["filename"],
+                    "size_bytes": item["size_bytes"],
+                    "sheets": item["inspection"].get("sheets", {}),
+                    "checks": checks,
+                    "all_passed": file_passed,
+                }
+            )
+            stat_observations.append(
+                {
+                    "filename": item["filename"],
+                    "date": item["day"].strftime("%Y-%m-%d"),
+                    "size_bytes": item["size_bytes"],
+                    "sheets": item["inspection"].get("sheets", {}),
+                }
+            )
+
+        if scraper_result["files_found"] == 0:
+            scraper_result["all_passed"] = False
+            any_failure = True
+            scraper_result["checks_total"] += 1
+            scraper_result["files"].append(
+                {
+                    "key": "",
+                    "filename": "(none)",
+                    "checks": [
+                        {
+                            "check": "files_found",
+                            "passed": False,
+                            "detail": f"No .xlsx files under {base_path} for target dates",
+                            "severity": "critical",
+                        }
+                    ],
+                    "all_passed": False,
+                }
+            )
+
+        report["scrapers"].append(scraper_result)
+
+        if stat_observations:
+            stats_merged = merge_stats(stats_merged, scraper_name, stat_observations)
+
+    report_key = f"{report_base}/monitor/{args.date}/report.json"
+    upload_bytes(
+        client,
+        bucket,
+        report_key,
+        json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8"),
+        "application/json",
+    )
+    print(f"Report uploaded to r2://{bucket}/{report_key}")
+
+    if stats_merged:
+        stats_key = f"{report_base}/{MONITOR_STATS_KEY}"
+        stats_body = yaml.safe_dump(stats_merged, sort_keys=False, allow_unicode=True).encode("utf-8")
+        upload_bytes(client, bucket, stats_key, stats_body, "text/yaml")
+        print(f"Stats uploaded to r2://{bucket}/{stats_key}")
+
+    print_summary_table(report)
+    write_step_summary(report)
+
+    if args.fail_on_error and any_failure:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

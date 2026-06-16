@@ -86,3 +86,31 @@ jobs:
           echo "### Part ${{ matrix.part }} Complete ✓" >> $GITHUB_STEP_SUMMARY
           echo "- Pages scraped: ${{ matrix.start_page }}-${{ matrix.end_page }}" >> $GITHUB_STEP_SUMMARY
           echo "- Total pages in part: ${{ matrix.total_pages_in_part }}" >> $GITHUB_STEP_SUMMARY
+
+  validate-r2:
+    name: Validate R2 Excel Schema
+    needs: scrape
+    if: always() && !cancelled() && needs.scrape.result != 'skipped'
+    runs-on: ubuntu-latest
+    env:
+      CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+      CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+      CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+      CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyyaml
+
+      - name: Validate uploaded Excel files in R2
+        run: |
+          RUN_DATE=$(date -u +%Y-%m-%d)
+          echo "Validating R2 Excel files for date: $RUN_DATE"
+          python monitor/inspect_r2_schema.py --date "$RUN_DATE" --fail-on-error
