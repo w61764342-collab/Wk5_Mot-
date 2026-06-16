@@ -20,8 +20,10 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from openpyxl import load_workbook
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "websites-config.yml")
+LOCAL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "websites-config.yml")
 MONITOR_STATS_KEY = "monitor/monitor_stats.yml"
+CONFIG_KEY = "monitor/websites-config.yml"
+DEFAULT_CONFIG_BASE = "motorgy"
 
 
 def get_env(name: str) -> str:
@@ -40,11 +42,6 @@ def build_r2_client():
         region_name="us-east-1",
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
-
-
-def load_config() -> dict:
-    with open(CONFIG_PATH, encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
 
 
 def strip_bucket_placeholder(r2_path: str) -> str:
@@ -73,6 +70,30 @@ def list_xlsx_objects(client, bucket: str, prefix: str) -> List[dict]:
 def download_object(client, bucket: str, key: str) -> bytes:
     response = client.get_object(Bucket=bucket, Key=key)
     return response["Body"].read()
+
+
+def load_config_from_r2(client, bucket: str, base_path: str = DEFAULT_CONFIG_BASE) -> dict:
+    """Load websites-config.yml from R2 at {base_path}/monitor/websites-config.yml."""
+    key = f"{base_path.rstrip('/')}/{CONFIG_KEY}"
+    try:
+        body = download_object(client, bucket, key)
+        print(f"Loaded config from r2://{bucket}/{key}")
+        return yaml.safe_load(body) or {}
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] not in ("NoSuchKey", "404"):
+            raise
+        if os.path.isfile(LOCAL_CONFIG_PATH):
+            print(
+                f"WARNING: Config not found at r2://{bucket}/{key}, "
+                f"using local fallback {LOCAL_CONFIG_PATH}",
+                file=sys.stderr,
+            )
+            with open(LOCAL_CONFIG_PATH, encoding="utf-8") as fh:
+                return yaml.safe_load(fh) or {}
+        raise RuntimeError(
+            f"websites-config.yml not found at r2://{bucket}/{key} "
+            f"and no local fallback at {LOCAL_CONFIG_PATH}"
+        ) from exc
 
 
 def inspect_workbook(content: bytes) -> Dict[str, Any]:
@@ -373,9 +394,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    config = load_config()
     bucket = get_env("CF_R2_BUCKET_NAME")
     client = build_r2_client()
+    config_base = os.getenv("CONFIG_R2_BASE", DEFAULT_CONFIG_BASE)
+    config = load_config_from_r2(client, bucket, config_base)
 
     schema_cfg = {s["scraper"]: s for s in config.get("excel_schema", [])}
 
