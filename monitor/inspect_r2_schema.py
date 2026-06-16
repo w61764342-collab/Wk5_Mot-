@@ -353,6 +353,83 @@ def upload_bytes(client, bucket: str, key: str, content: bytes, content_type: st
     client.put_object(Bucket=bucket, Key=key, Body=content, ContentType=content_type)
 
 
+def collect_failures(results: dict) -> List[dict]:
+    """Flatten failed checks across all scrapers/files."""
+    failures: List[dict] = []
+    for scraper in results.get("scrapers", []):
+        for file_result in scraper.get("files", []):
+            for check in file_result.get("checks", []):
+                if check.get("passed"):
+                    continue
+                failures.append(
+                    {
+                        "scraper": scraper["name"],
+                        "filename": file_result.get("filename", ""),
+                        "key": file_result.get("key", ""),
+                        "check": check.get("check", ""),
+                        "severity": check.get("severity", "unknown"),
+                        "detail": check.get("detail", ""),
+                    }
+                )
+    return failures
+
+
+def print_file_inventory(scraper_name: str, pending_files: List[dict]) -> None:
+    print(f"\nFiles found for {scraper_name}: {len(pending_files)}")
+    for item in pending_files:
+        sheets = item["inspection"].get("sheets", {})
+        sheet_summary = ", ".join(
+            f"{name}={data.get('row_count', 0)} rows"
+            for name, data in sheets.items()
+        )
+        size_kb = item["size_bytes"] / 1024
+        print(f"  - {item['filename']}")
+        print(f"    key: {item['key']}")
+        print(f"    size: {size_kb:.1f} KB | {sheet_summary or 'no sheets'}")
+
+
+def print_failure_report(results: dict) -> None:
+    failures = collect_failures(results)
+    if not failures:
+        print("\nAll checks passed.")
+        return
+
+    print(f"\nFailed checks ({len(failures)}):")
+    print("-" * 72)
+    for entry in failures:
+        severity = entry["severity"].upper()
+        print(f"[{severity}] {entry['scraper']} :: {entry['filename']}")
+        print(f"  check: {entry['check']}")
+        print(f"  detail: {entry['detail']}")
+        if entry["key"]:
+            print(f"  key: {entry['key']}")
+        print("-" * 72)
+
+
+def print_per_file_status(results: dict) -> None:
+    print("\nPer-file status:")
+    for scraper in results.get("scrapers", []):
+        for file_result in scraper.get("files", []):
+            filename = file_result.get("filename", "")
+            if filename.startswith("("):
+                continue
+            status = "PASS" if file_result.get("all_passed") else "FAIL"
+            sheets = file_result.get("sheets", {})
+            row_total = sum(s.get("row_count", 0) for s in sheets.values())
+            size_kb = file_result.get("size_bytes", 0) / 1024
+            print(
+                f"  {status:<4} {filename} "
+                f"({row_total} rows, {size_kb:.1f} KB)"
+            )
+            if not file_result.get("all_passed"):
+                for check in file_result.get("checks", []):
+                    if not check.get("passed"):
+                        print(
+                            f"       └─ [{check.get('severity', '?').upper()}] "
+                            f"{check.get('check')}: {check.get('detail')}"
+                        )
+
+
 def write_step_summary(results: dict) -> None:
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if not summary_path:
@@ -379,10 +456,24 @@ def write_step_summary(results: dict) -> None:
             failed = [c for c in file_result.get("checks", []) if not c["passed"]]
             if not failed:
                 continue
-            lines.append(f"**{file_result['filename']}** (`{file_result['key']}`)")
+            lines.append(f"**{file_result['filename']}**")
+            if file_result.get("key"):
+                lines.append(f"`{file_result['key']}`")
             for check in failed:
-                lines.append(f"- {check['check']}: {check['detail']}")
+                lines.append(
+                    f"- **[{check.get('severity', '?').upper()}]** "
+                    f"`{check['check']}`: {check['detail']}"
+                )
             lines.append("")
+
+    failures = collect_failures(results)
+    if failures:
+        lines.extend(["", "### Failure summary", ""])
+        for entry in failures:
+            lines.append(
+                f"- **[{entry['severity'].upper()}]** `{entry['check']}` — "
+                f"{entry['filename']}: {entry['detail']}"
+            )
 
     with open(summary_path, "a", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -434,6 +525,8 @@ def main() -> int:
     target_date = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     dates = [target_date - timedelta(days=offset) for offset in range(args.days_lookback)]
     report["target_dates"] = [d.strftime("%Y-%m-%d") for d in dates]
+    print(f"Validation target date(s): {', '.join(report['target_dates'])}")
+    print(f"Quality checks: {'enabled' if args.quality else 'disabled'}")
 
     for scraper in config.get("scrapers", []):
         scraper_name = scraper["name"]
@@ -456,7 +549,9 @@ def main() -> int:
 
         for day in dates:
             prefix = date_partition_prefix(base_path, day)
+            print(f"Listing R2 prefix: {prefix}/")
             objects = list_xlsx_objects(client, bucket, prefix)
+            print(f"  Found {len(objects)} .xlsx object(s)")
 
             for obj in objects:
                 key = obj["Key"]
@@ -477,6 +572,8 @@ def main() -> int:
                     }
                 )
 
+        print_file_inventory(scraper_name, pending_files)
+
         scraper_result["files_found"] = len(pending_files)
         known_parts = set(stats_merged.get(scraper_name, {}).get("parts", {}).keys())
         current_parts = {normalize_part_key(item["filename"]) for item in pending_files}
@@ -488,6 +585,12 @@ def main() -> int:
             if not parts_ok:
                 scraper_result["all_passed"] = False
                 any_failure = True
+                print(
+                    f"  FAIL (parts completeness): missing {missing_parts} "
+                    f"(expected {sorted(known_parts)})"
+                )
+            else:
+                print(f"  PASS (parts completeness): all {len(known_parts)} known parts present")
             scraper_result["files"].append(
                 {
                     "key": "",
@@ -538,6 +641,10 @@ def main() -> int:
             if not file_passed:
                 scraper_result["all_passed"] = False
                 any_failure = True
+                failed_names = [c["check"] for c in checks if not c["passed"]]
+                print(f"  FAIL {item['filename']}: {', '.join(failed_names)}")
+            else:
+                print(f"  PASS {item['filename']}")
 
             scraper_result["files"].append(
                 {
@@ -600,7 +707,14 @@ def main() -> int:
         print(f"Stats uploaded to r2://{bucket}/{stats_key}")
 
     print_summary_table(report)
+    print_per_file_status(report)
+    print_failure_report(report)
     write_step_summary(report)
+
+    if any_failure:
+        print("\nValidation result: FAIL")
+    else:
+        print("\nValidation result: PASS")
 
     if args.fail_on_error and any_failure:
         return 1
