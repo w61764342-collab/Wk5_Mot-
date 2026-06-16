@@ -152,8 +152,11 @@ def classify_columns(
     missing_required = [col for col in required if col not in actual]
 
     union_set = set(known_union or [])
+    required_in_union = [col for col in union_set if col in required_set]
     new_columns = [col for col in actual if union_set and col not in union_set]
-    dropped_from_union = [col for col in union_set if col not in actual] if union_set else []
+    dropped_from_union = (
+        [col for col in required_in_union if col not in actual] if required_in_union else []
+    )
 
     return {
         "total_columns": len(actual),
@@ -218,9 +221,9 @@ def validate_column_schema(
                 "check": "column_union",
                 "passed": len(dropped) == 0,
                 "detail": (
-                    f"Columns missing vs R2 history: {dropped}"
+                    f"Required columns missing vs R2 history: {dropped}"
                     if dropped
-                    else f"All {len(known_union)} known columns present"
+                    else f"All {len(sheet_schema.get('required_columns', []))} required columns match history"
                 ),
                 "severity": "medium",
             }
@@ -490,6 +493,67 @@ def merge_stats(
     return stats
 
 
+def check_cross_part_column_consistency(
+    pending_files: List[dict],
+    sheet_schema: dict,
+    primary_sheet: str,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """Required columns must match across parts; dynamic inspection columns may differ."""
+    required_cols = sheet_schema.get("required_columns", [])
+    required_set = set(required_cols)
+    patterns = sheet_schema.get("dynamic_column_patterns", DEFAULT_DYNAMIC_COLUMN_PATTERNS)
+
+    required_sets: Dict[tuple, List[str]] = {}
+    part_details: List[dict] = []
+
+    for item in pending_files:
+        cols = item["inspection"]["sheets"].get(primary_sheet, {}).get("columns", [])
+        part_required = sorted(c for c in cols if c in required_set)
+        part_dynamic = sorted(
+            c for c in cols
+            if c not in required_set and any(fnmatch.fnmatch(c, p) for p in patterns)
+        )
+        required_sets.setdefault(tuple(part_required), []).append(item["filename"])
+        part_details.append(
+            {
+                "filename": item["filename"],
+                "total_columns": len(cols),
+                "required_count": len(part_required),
+                "dynamic_count": len(part_dynamic),
+            }
+        )
+
+    consistency_ok = len(required_sets) <= 1
+    dynamic_counts = [p["dynamic_count"] for p in part_details]
+    dynamic_note = (
+        f"dynamic inspection columns vary by part "
+        f"({min(dynamic_counts)}–{max(dynamic_counts)} cols) — expected"
+        if dynamic_counts and min(dynamic_counts) != max(dynamic_counts)
+        else f"each part has {dynamic_counts[0]} dynamic inspection columns"
+        if dynamic_counts
+        else "no dynamic columns"
+    )
+
+    if consistency_ok:
+        detail = (
+            f"All {len(pending_files)} parts share {len(required_cols)} required columns; "
+            f"{dynamic_note}"
+        )
+    else:
+        mismatches = [
+            f"{files[0]} (missing required: "
+            f"{sorted(required_set - set(c for c in required_sets.keys() for c in c))})"
+            for _, files in required_sets.items()
+        ]
+        detail = f"Required columns differ across parts: {'; '.join(mismatches)}"
+
+    return consistency_ok, detail, {
+        "required_columns_match": consistency_ok,
+        "parts": part_details,
+        "required_column_count": len(required_cols),
+    }
+
+
 def upload_bytes(client, bucket: str, key: str, content: bytes, content_type: str) -> None:
     client.put_object(Bucket=bucket, Key=key, Body=content, ContentType=content_type)
 
@@ -498,6 +562,18 @@ def collect_failures(results: dict) -> List[dict]:
     """Flatten failed checks across all scrapers/files."""
     failures: List[dict] = []
     for scraper in results.get("scrapers", []):
+        consistency = scraper.get("column_consistency")
+        if consistency and not consistency.get("passed"):
+            failures.append(
+                {
+                    "scraper": scraper["name"],
+                    "filename": "(column consistency)",
+                    "key": "",
+                    "check": "column_consistency",
+                    "severity": "high",
+                    "detail": consistency.get("detail", ""),
+                }
+            )
         for file_result in scraper.get("files", []):
             for check in file_result.get("checks", []):
                 if check.get("passed"):
@@ -543,7 +619,7 @@ def print_column_schema_report(scraper_name: str, scraper_result: dict) -> None:
     consistency = scraper_result.get("column_consistency")
     if consistency:
         status = "PASS" if consistency.get("passed") else "FAIL"
-        print(f"  Cross-part column consistency: {status} — {consistency.get('detail')}")
+        print(f"  Cross-part required columns: {status} — {consistency.get('detail')}")
 
 
 def print_file_inventory(scraper_name: str, pending_files: List[dict]) -> None:
@@ -562,7 +638,8 @@ def print_file_inventory(scraper_name: str, pending_files: List[dict]) -> None:
 
 def print_failure_report(results: dict) -> None:
     failures = collect_failures(results)
-    if not failures:
+    any_scraper_failed = any(not s.get("all_passed") for s in results.get("scrapers", []))
+    if not failures and not any_scraper_failed:
         print("\nAll checks passed.")
         return
 
@@ -864,34 +941,21 @@ def main() -> int:
 
         if pending_files:
             all_columns: List[str] = []
-            column_sets: Dict[tuple, List[str]] = {}
             for item in pending_files:
                 cols = item["inspection"]["sheets"].get(primary_sheet, {}).get("columns", [])
                 all_columns.extend(col for col in cols if col not in all_columns)
-                column_sets.setdefault(tuple(cols), []).append(item["filename"])
 
             scraper_result["column_schema_summary"] = {
                 primary_sheet: classify_columns(all_columns, sheet_schema, known_union)
             }
 
-            consistency_ok = len(column_sets) <= 1
-            if consistency_ok:
-                consistency_detail = (
-                    f"All {len(pending_files)} parts share "
-                    f"{len(all_columns)} columns on '{primary_sheet}'"
-                )
-            else:
-                mismatches = [
-                    f"{files[0]} ({len(cols)} cols)"
-                    for cols, files in column_sets.items()
-                ]
-                consistency_detail = (
-                    f"{len(column_sets)} different column sets across parts: "
-                    f"{'; '.join(mismatches)}"
-                )
+            consistency_ok, consistency_detail, consistency_meta = check_cross_part_column_consistency(
+                pending_files, sheet_schema, primary_sheet
+            )
             scraper_result["column_consistency"] = {
                 "passed": consistency_ok,
                 "detail": consistency_detail,
+                **consistency_meta,
             }
             if len(pending_files) > 1:
                 scraper_result["checks_total"] += 1
