@@ -8,3 +8,5 @@ monitor.md
 websites-config.yml
 prompts/excel-schema-prompt.md
 prompts/monitor-prompt.md
+monitor/site.yml
+monitor/ads.md

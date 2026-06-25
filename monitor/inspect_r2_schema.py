@@ -21,6 +21,12 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from openpyxl import load_workbook
 
+_MONITOR_DIR = os.path.dirname(os.path.abspath(__file__))
+if _MONITOR_DIR not in sys.path:
+    sys.path.insert(0, _MONITOR_DIR)
+
+from ads_counter import count_scraper_ads
+
 LOCAL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "websites-config.yml")
 MONITOR_STATS_KEY = "monitor/monitor_stats.yml"
 CONFIG_KEY = "monitor/websites-config.yml"
@@ -687,15 +693,19 @@ def write_step_summary(results: dict) -> None:
     lines = [
         "## R2 Excel Schema Monitor",
         "",
-        "| Scraper | Files | Passed | Total checks | Status |",
-        "|---------|-------|--------|--------------|--------|",
+        "| Scraper | Files | Unique ads | Passed | Total checks | Status |",
+        "|---------|-------|------------|--------|--------------|--------|",
     ]
     for scraper in results.get("scrapers", []):
         status = "PASS" if scraper.get("all_passed") else "FAIL"
         lines.append(
             f"| {scraper['name']} | {scraper['files_found']} | "
+            f"{scraper.get('unique_ads', 0)} | "
             f"{scraper['checks_passed']} | {scraper['checks_total']} | {status} |"
         )
+    total_unique = results.get("total_unique_ads")
+    if total_unique is not None:
+        lines.extend(["", f"**Total unique ads:** {total_unique}", ""])
 
     for scraper in results.get("scrapers", []):
         if scraper.get("all_passed"):
@@ -751,15 +761,20 @@ def write_step_summary(results: dict) -> None:
 def print_summary_table(results: dict) -> None:
     print("\nR2 Excel Schema Monitor Summary")
     print("-" * 72)
-    print(f"{'Scraper':<24} {'Files':>6} {'Passed':>8} {'Total':>8} {'Status':>8}")
+    print(
+        f"{'Scraper':<24} {'Files':>6} {'Ads':>8} {'Passed':>8} {'Total':>8} {'Status':>8}"
+    )
     print("-" * 72)
     for scraper in results.get("scrapers", []):
         status = "PASS" if scraper.get("all_passed") else "FAIL"
         print(
             f"{scraper['name']:<24} {scraper['files_found']:>6} "
+            f"{scraper.get('unique_ads', 0):>8} "
             f"{scraper['checks_passed']:>8} {scraper['checks_total']:>8} {status:>8}"
         )
     print("-" * 72)
+    if results.get("total_unique_ads") is not None:
+        print(f"Total unique ads: {results['total_unique_ads']}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -969,6 +984,18 @@ def main() -> int:
 
             print_column_schema_report(scraper_name, scraper_result)
 
+        excel_downloads = [(item["key"], item["content"]) for item in pending_files]
+        ads_stats = count_scraper_ads(
+            client, bucket, base_path, target_date, excel_downloads
+        )
+        scraper_result["unique_ads"] = ads_stats.get("unique_ads") or 0
+        scraper_result["total_rows"] = ads_stats.get("total_rows") or 0
+        scraper_result["ads_source"] = ads_stats.get("ads_source", "none")
+        print(
+            f"  Unique ads: {scraper_result['unique_ads']} "
+            f"(source: {scraper_result['ads_source']})"
+        )
+
         if scraper_result["files_found"] == 0:
             scraper_result["all_passed"] = False
             any_failure = True
@@ -995,6 +1022,10 @@ def main() -> int:
             stats_merged = merge_stats(
                 stats_merged, scraper_name, stat_observations, schema_entry
             )
+
+    report["total_unique_ads"] = sum(
+        r.get("unique_ads") or 0 for r in report["scrapers"]
+    )
 
     report_key = f"{report_base}/monitor/{args.date}/report.json"
     upload_bytes(
