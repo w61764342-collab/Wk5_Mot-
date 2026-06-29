@@ -26,6 +26,7 @@ if _MONITOR_DIR not in sys.path:
     sys.path.insert(0, _MONITOR_DIR)
 
 from ads_counter import count_scraper_ads
+from r2_file_counter import count_scraper_r2_files, count_site_r2_files
 
 LOCAL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "websites-config.yml")
 MONITOR_STATS_KEY = "monitor/monitor_stats.yml"
@@ -693,19 +694,23 @@ def write_step_summary(results: dict) -> None:
     lines = [
         "## R2 Excel Schema Monitor",
         "",
-        "| Scraper | Files | Unique ads | Passed | Total checks | Status |",
-        "|---------|-------|------------|--------|--------------|--------|",
+        "| Scraper | Files | R2 files | Unique ads | Passed | Total checks | Status |",
+        "|---------|-------|----------|------------|--------|--------------|--------|",
     ]
     for scraper in results.get("scrapers", []):
         status = "PASS" if scraper.get("all_passed") else "FAIL"
         lines.append(
             f"| {scraper['name']} | {scraper['files_found']} | "
+            f"{scraper.get('r2_file_count', '—')} | "
             f"{scraper.get('unique_ads', 0)} | "
             f"{scraper['checks_passed']} | {scraper['checks_total']} | {status} |"
         )
     total_unique = results.get("total_unique_ads")
+    total_r2 = results.get("total_r2_files")
     if total_unique is not None:
         lines.extend(["", f"**Total unique ads:** {total_unique}", ""])
+    if total_r2 is not None:
+        lines.extend(["", f"**Total R2 files:** {total_r2:,}", ""])
 
     for scraper in results.get("scrapers", []):
         if scraper.get("all_passed"):
@@ -762,19 +767,22 @@ def print_summary_table(results: dict) -> None:
     print("\nR2 Excel Schema Monitor Summary")
     print("-" * 72)
     print(
-        f"{'Scraper':<24} {'Files':>6} {'Ads':>8} {'Passed':>8} {'Total':>8} {'Status':>8}"
+        f"{'Scraper':<24} {'Files':>6} {'R2':>8} {'Ads':>8} {'Passed':>8} {'Total':>8} {'Status':>8}"
     )
     print("-" * 72)
     for scraper in results.get("scrapers", []):
         status = "PASS" if scraper.get("all_passed") else "FAIL"
         print(
             f"{scraper['name']:<24} {scraper['files_found']:>6} "
+            f"{scraper.get('r2_file_count', 0):>8} "
             f"{scraper.get('unique_ads', 0):>8} "
             f"{scraper['checks_passed']:>8} {scraper['checks_total']:>8} {status:>8}"
         )
     print("-" * 72)
     if results.get("total_unique_ads") is not None:
         print(f"Total unique ads: {results['total_unique_ads']}")
+    if results.get("total_r2_files") is not None:
+        print(f"Total R2 files: {results['total_r2_files']:,}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -996,6 +1004,10 @@ def main() -> int:
             f"(source: {scraper_result['ads_source']})"
         )
 
+        scraper_result["r2_file_count"] = count_scraper_r2_files(
+            client, bucket, base_path
+        )
+
         if scraper_result["files_found"] == 0:
             scraper_result["all_passed"] = False
             any_failure = True
@@ -1026,6 +1038,16 @@ def main() -> int:
     report["total_unique_ads"] = sum(
         r.get("unique_ads") or 0 for r in report["scrapers"]
     )
+
+    site_r2_prefix = (config.get("r2_prefix") or report_base).strip("/")
+    if site_r2_prefix:
+        report["total_r2_files"] = count_site_r2_files(
+            client, bucket, site_r2_prefix
+        )
+    else:
+        report["total_r2_files"] = sum(
+            r.get("r2_file_count") or 0 for r in report["scrapers"]
+        )
 
     report_key = f"{report_base}/monitor/{args.date}/report.json"
     upload_bytes(
