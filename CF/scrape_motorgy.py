@@ -30,6 +30,75 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class TrackingSession(requests.Session):
+    """HTTP session that counts requests and failures for monitor hub metrics."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.request_count = 0
+        self.requests_failed = 0
+        self.failed_items: List[Dict[str, object]] = []
+
+    def request(self, method, url, **kwargs):
+        self.request_count += 1
+        try:
+            response = super().request(method, url, **kwargs)
+            if response.status_code >= 400:
+                self.requests_failed += 1
+            return response
+        except Exception:
+            self.requests_failed += 1
+            raise
+
+    def record_failure(self, name: str, detail: str, errors: int = 1) -> None:
+        self.failed_items.append({"name": name, "errors": errors, "detail": detail})
+
+
+def build_request_metrics(
+    session: TrackingSession,
+    start_time: float,
+    total_listings: int,
+) -> Dict[str, object]:
+    duration_sec = max(1, int(time.time() - start_time))
+    requests_total = session.request_count
+    requests_failed = session.requests_failed
+    requests_per_min = (
+        round(requests_total / (duration_sec / 60), 2) if duration_sec > 0 else 0
+    )
+    metrics: Dict[str, object] = {
+        "requests_total": requests_total,
+        "requests_failed": requests_failed,
+        "requests_per_min": requests_per_min,
+        "duration_sec": duration_sec,
+    }
+    if session.failed_items:
+        metrics["failed_items"] = session.failed_items
+    return {
+        "scraped_at": datetime.utcnow().isoformat(),
+        "saved_to_s3_date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "total_listings": total_listings,
+        "request_metrics": metrics,
+    }
+
+
+def upload_json_summary(
+    r2_client,
+    bucket: str,
+    r2_prefix: str,
+    summary: Dict[str, object],
+    timestamp: str,
+) -> None:
+    key = f"{r2_prefix}/json-files/summary_{timestamp}.json"
+    body = json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8")
+    r2_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=body,
+        ContentType="application/json",
+    )
+    logger.info("JSON summary uploaded to r2://%s/%s", bucket, key)
+
+
 def get_env(name: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
     value = os.getenv(name, default)
     if required and not value:
@@ -265,10 +334,12 @@ def scrape_all() -> None:
     access_key = get_env("CF_R2_ACCESS_KEY_ID")
     secret_key = get_env("CF_R2_SECRET_ACCESS_KEY")
 
+    start_time = time.time()
     run_date = datetime.utcnow()
     year = run_date.strftime("%Y")
     month = run_date.strftime("%m")
     day = run_date.strftime("%d")
+    timestamp = run_date.strftime("%Y%m%d")
     part_label = get_env("PART_LABEL", required=False, default=None)
     r2_prefix = f"motorgy/year={year}/month={month}/day={day}"
     if part_label:
@@ -305,15 +376,28 @@ def scrape_all() -> None:
         ),
     )
 
-    session = requests.Session()
+    session = TrackingSession()
     session.headers.update(DEFAULT_HEADERS)
+    results: List[Dict[str, object]] = []
+
+    def finish_scrape() -> None:
+        summary = build_request_metrics(session, start_time, len(results))
+        part_suffix = f"_part-{part_label}" if part_label else ""
+        upload_json_summary(
+            r2_client,
+            bucket,
+            r2_prefix,
+            summary,
+            f"{timestamp}{part_suffix}",
+        )
 
     all_links: List[str] = []
-    page = 1
     first_page_url = f"{USED_CARS_URL}?pn=1"
     first_resp = session.get(first_page_url, timeout=30)
     if first_resp.status_code != 200:
         logger.error("Failed to load first page: %s (status %s)", first_page_url, first_resp.status_code)
+        session.record_failure("listing page 1", f"HTTP {first_resp.status_code}")
+        finish_scrape()
         return
 
     total_pages = parse_total_pages(first_resp.text) or 1
@@ -325,6 +409,11 @@ def scrape_all() -> None:
         start_page = 1
     if start_page > total_pages:
         logger.warning("Start page (%s) exceeds total pages (%s). Nothing to do.", start_page, total_pages)
+        session.record_failure(
+            f"part {part_label or 'main'}",
+            f"start page {start_page} exceeds total pages {total_pages}",
+        )
+        finish_scrape()
         return
     print(f"Total pages detected: {total_pages}")
     logger.info("Total pages detected: %s", total_pages)
@@ -340,10 +429,12 @@ def scrape_all() -> None:
         resp = session.get(page_url, timeout=30)
         if resp.status_code != 200:
             logger.warning("Failed page %s: %s (status %s)", page, page_url, resp.status_code)
+            session.record_failure(f"listing page {page}", f"HTTP {resp.status_code}")
             break
         links = parse_listing_page(resp.text)
         if not links:
             logger.warning("No links found on page %s", page)
+            session.record_failure(f"listing page {page}", "no links found")
             break
         new_links = [l for l in links if l not in all_links]
         if not new_links:
@@ -357,7 +448,6 @@ def scrape_all() -> None:
 
     logger.info("Total unique ads: %s", len(all_links))
 
-    results: List[Dict[str, object]] = []
     for idx, detail_url in enumerate(all_links, start=1):
         logger.info("Scraping ad %s/%s: %s", idx, len(all_links), detail_url)
         ad_id = parse_ad_id(detail_url)
@@ -365,6 +455,7 @@ def scrape_all() -> None:
             data = scrape_detail(session, detail_url)
         except Exception as exc:
             logger.warning("Failed to scrape detail %s: %s", detail_url, exc)
+            session.record_failure(f"ad {ad_id}", str(exc))
             continue
         image_urls = data.pop("image_urls", [])
 
@@ -382,6 +473,7 @@ def scrape_all() -> None:
                 r2_image_paths.append(f"r2://{bucket}/{key}")
             except Exception as exc:
                 logger.warning("Image upload failed (%s): %s", img_url, exc)
+                session.record_failure(f"ad {ad_id} image", str(exc))
                 continue
 
         row = {
@@ -413,7 +505,6 @@ def scrape_all() -> None:
     df = pd.DataFrame(results)
     output_dir = os.path.join(os.getcwd(), "output")
     os.makedirs(output_dir, exist_ok=True)
-    timestamp = run_date.strftime("%Y%m%d")
     part_suffix = f"_part-{part_label}" if part_label else ""
     excel_name = f"motorgy_used_cars_{timestamp}{part_suffix}.xlsx"
     excel_path = os.path.join(output_dir, excel_name)
@@ -424,6 +515,8 @@ def scrape_all() -> None:
     excel_key = f"{r2_prefix}/excel_files/{excel_name}"
     r2_client.upload_file(excel_path, bucket, excel_key)
     logger.info("Excel uploaded to r2://%s/%s", bucket, excel_key)
+
+    finish_scrape()
     print("Scrape complete.")
 
 

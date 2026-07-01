@@ -26,7 +26,13 @@ if _MONITOR_DIR not in sys.path:
     sys.path.insert(0, _MONITOR_DIR)
 
 from ads_counter import count_scraper_ads
+from github_workflows import build_scraper_run_meta, load_site_run_meta
 from r2_file_counter import count_scraper_r2_files, count_site_r2_files
+from request_metrics import (
+    aggregate_site_request_metrics,
+    build_run_error_summary,
+    count_scraper_request_metrics,
+)
 
 LOCAL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "websites-config.yml")
 MONITOR_STATS_KEY = "monitor/monitor_stats.yml"
@@ -798,6 +804,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    run_started_at = datetime.now(timezone.utc)
     bucket = get_env("CF_R2_BUCKET_NAME")
     client = build_r2_client()
     config_base = os.getenv("CONFIG_R2_BASE", DEFAULT_CONFIG_BASE)
@@ -1008,6 +1015,24 @@ def main() -> int:
             client, bucket, base_path
         )
 
+        req_stats = count_scraper_request_metrics(
+            client, bucket, base_path, target_date
+        )
+        scraper_result["requests_total"] = req_stats.get("requests_total")
+        scraper_result["requests_failed"] = req_stats.get("requests_failed")
+        scraper_result["error_rate_pct"] = req_stats.get("error_rate_pct")
+        scraper_result["requests_per_min"] = req_stats.get("requests_per_min")
+        scraper_result["duration_sec"] = req_stats.get("duration_sec")
+        scraper_result["metrics_source"] = req_stats.get("metrics_source", "none")
+        if req_stats.get("failed_items_summary"):
+            scraper_result["failed_items_summary"] = req_stats["failed_items_summary"]
+        if req_stats.get("metrics_source") != "none":
+            print(
+                f"  Request metrics: {scraper_result.get('requests_total', 0)} total, "
+                f"{scraper_result.get('requests_failed', 0)} failed, "
+                f"{scraper_result.get('error_rate_pct', 0)}% error rate"
+            )
+
         if scraper_result["files_found"] == 0:
             scraper_result["all_passed"] = False
             any_failure = True
@@ -1048,6 +1073,19 @@ def main() -> int:
         report["total_r2_files"] = sum(
             r.get("r2_file_count") or 0 for r in report["scrapers"]
         )
+
+    site_metrics = aggregate_site_request_metrics(report["scrapers"])
+    report.update(site_metrics)
+    report["error_summary"] = build_run_error_summary(report["scrapers"], [])
+
+    site_meta = load_site_run_meta()
+    report["github_run"] = build_scraper_run_meta(
+        site_meta,
+        args.date,
+        run_started_at.replace(tzinfo=None),
+        not any_failure,
+    )
+    report["run_place"] = report["github_run"].get("run_place")
 
     report_key = f"{report_base}/monitor/{args.date}/report.json"
     upload_bytes(

@@ -1,5 +1,9 @@
 name: R2 Excel Schema Monitor
 
+permissions:
+  contents: read
+  actions: read
+
 on:
   workflow_run:
     workflows:
