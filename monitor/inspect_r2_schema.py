@@ -1079,12 +1079,18 @@ def main() -> int:
     report["error_summary"] = build_run_error_summary(report["scrapers"], [])
 
     site_meta = load_site_run_meta()
-    report["github_run"] = build_scraper_run_meta(
+    github_run = build_scraper_run_meta(
         site_meta,
         args.date,
         run_started_at.replace(tzinfo=None),
         not any_failure,
     )
+    github_gmail = (site_meta.get("github_gmail") or site_meta.get("github_email") or "").strip()
+    if github_gmail:
+        github_run["github_gmail"] = github_gmail
+    report["github_run"] = github_run
+    if github_gmail:
+        report["github_gmail"] = github_gmail
     report["run_place"] = report["github_run"].get("run_place")
 
     report_key = f"{report_base}/monitor/{args.date}/report.json"
