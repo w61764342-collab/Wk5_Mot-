@@ -81,6 +81,11 @@ def build_request_metrics(
     }
 
 
+def build_r2_key(r2_prefix: str, file_name: str) -> str:
+    normalized_prefix = r2_prefix.rstrip("/")
+    return f"{normalized_prefix}/json version/{file_name}"
+
+
 def upload_json_summary(
     r2_client,
     bucket: str,
@@ -88,7 +93,7 @@ def upload_json_summary(
     summary: Dict[str, object],
     timestamp: str,
 ) -> None:
-    key = f"{r2_prefix}/json-files/summary_{timestamp}.json"
+    key = build_r2_key(r2_prefix, f"summary_{timestamp}.json")
     body = json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8")
     r2_client.put_object(
         Bucket=bucket,
@@ -97,6 +102,24 @@ def upload_json_summary(
         ContentType="application/json",
     )
     logger.info("JSON summary uploaded to r2://%s/%s", bucket, key)
+
+
+def upload_json_payload(
+    r2_client,
+    bucket: str,
+    r2_prefix: str,
+    payload: Dict[str, object],
+    file_name: str,
+) -> None:
+    key = build_r2_key(r2_prefix, file_name)
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    r2_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=body,
+        ContentType="application/json",
+    )
+    logger.info("JSON payload uploaded to r2://%s/%s", bucket, key)
 
 
 def get_env(name: str, required: bool = True, default: Optional[str] = None) -> Optional[str]:
@@ -389,6 +412,22 @@ def scrape_all() -> None:
             r2_prefix,
             summary,
             f"{timestamp}{part_suffix}",
+        )
+
+        payload = {
+            "scraped_at": summary.get("scraped_at"),
+            "saved_to_s3_date": summary.get("saved_to_s3_date"),
+            "part_label": part_label,
+            "total_listings": len(results),
+            "listings": results,
+            "request_metrics": summary.get("request_metrics"),
+        }
+        upload_json_payload(
+            r2_client,
+            bucket,
+            r2_prefix,
+            payload,
+            f"motorgy_used_cars_{timestamp}{part_suffix}.json",
         )
 
     all_links: List[str] = []
