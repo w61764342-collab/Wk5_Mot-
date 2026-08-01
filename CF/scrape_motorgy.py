@@ -81,9 +81,9 @@ def build_request_metrics(
     }
 
 
-def build_r2_key(r2_prefix: str, file_name: str) -> str:
+def build_r2_key(r2_prefix: str, folder_name: str, file_name: str) -> str:
     normalized_prefix = r2_prefix.rstrip("/")
-    return f"{normalized_prefix}/json version/{file_name}"
+    return f"{normalized_prefix}/{folder_name}/{file_name}"
 
 
 def upload_json_summary(
@@ -93,7 +93,7 @@ def upload_json_summary(
     summary: Dict[str, object],
     timestamp: str,
 ) -> None:
-    key = build_r2_key(r2_prefix, f"summary_{timestamp}.json")
+    key = build_r2_key(r2_prefix, "json-files", f"summary_{timestamp}.json")
     body = json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8")
     r2_client.put_object(
         Bucket=bucket,
@@ -111,7 +111,7 @@ def upload_json_payload(
     payload: Dict[str, object],
     file_name: str,
 ) -> None:
-    key = build_r2_key(r2_prefix, file_name)
+    key = build_r2_key(r2_prefix, "json version", file_name)
     body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     r2_client.put_object(
         Bucket=bucket,
