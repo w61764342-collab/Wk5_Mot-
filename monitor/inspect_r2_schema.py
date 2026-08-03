@@ -27,7 +27,7 @@ if _MONITOR_DIR not in sys.path:
 
 from ads_counter import count_scraper_ads
 from github_workflows import build_scraper_run_meta, load_site_run_meta
-from r2_file_counter import count_scraper_r2_files, count_site_r2_files
+from r2_file_counter import count_scraper_r2_usage, count_site_r2_usage
 from request_metrics import (
     aggregate_site_request_metrics,
     build_run_error_summary,
@@ -692,6 +692,21 @@ def print_per_file_status(results: dict) -> None:
                         )
 
 
+def format_size_bytes(size_bytes: Optional[int]) -> str:
+    """Return bytes as a concise human-readable string."""
+    if size_bytes is None:
+        return "—"
+    value = float(size_bytes)
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    unit_index = 0
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(value):,} {units[unit_index]}"
+    return f"{value:,.2f} {units[unit_index]}"
+
+
 def write_step_summary(results: dict) -> None:
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if not summary_path:
@@ -700,23 +715,27 @@ def write_step_summary(results: dict) -> None:
     lines = [
         "## R2 Excel Schema Monitor",
         "",
-        "| Scraper | Files | R2 files | Unique ads | Passed | Total checks | Status |",
-        "|---------|-------|----------|------------|--------|--------------|--------|",
+        "| Scraper | Files | R2 files | R2 size | Unique ads | Passed | Total checks | Status |",
+        "|---------|-------|----------|---------|------------|--------|--------------|--------|",
     ]
     for scraper in results.get("scrapers", []):
         status = "PASS" if scraper.get("all_passed") else "FAIL"
         lines.append(
             f"| {scraper['name']} | {scraper['files_found']} | "
             f"{scraper.get('r2_file_count', '—')} | "
+            f"{format_size_bytes(scraper.get('r2_size_bytes'))} | "
             f"{scraper.get('unique_ads', 0)} | "
             f"{scraper['checks_passed']} | {scraper['checks_total']} | {status} |"
         )
     total_unique = results.get("total_unique_ads")
     total_r2 = results.get("total_r2_files")
+    total_r2_size = results.get("total_r2_size_bytes")
     if total_unique is not None:
         lines.extend(["", f"**Total unique ads:** {total_unique}", ""])
     if total_r2 is not None:
         lines.extend(["", f"**Total R2 files:** {total_r2:,}", ""])
+    if total_r2_size is not None:
+        lines.extend(["", f"**Total R2 size:** {format_size_bytes(total_r2_size)}", ""])
 
     for scraper in results.get("scrapers", []):
         if scraper.get("all_passed"):
@@ -773,7 +792,7 @@ def print_summary_table(results: dict) -> None:
     print("\nR2 Excel Schema Monitor Summary")
     print("-" * 72)
     print(
-        f"{'Scraper':<24} {'Files':>6} {'R2':>8} {'Ads':>8} {'Passed':>8} {'Total':>8} {'Status':>8}"
+        f"{'Scraper':<24} {'Files':>6} {'R2':>8} {'R2 Size':>12} {'Ads':>8} {'Passed':>8} {'Total':>8} {'Status':>8}"
     )
     print("-" * 72)
     for scraper in results.get("scrapers", []):
@@ -781,6 +800,7 @@ def print_summary_table(results: dict) -> None:
         print(
             f"{scraper['name']:<24} {scraper['files_found']:>6} "
             f"{scraper.get('r2_file_count', 0):>8} "
+            f"{format_size_bytes(scraper.get('r2_size_bytes', 0)):>12} "
             f"{scraper.get('unique_ads', 0):>8} "
             f"{scraper['checks_passed']:>8} {scraper['checks_total']:>8} {status:>8}"
         )
@@ -789,6 +809,8 @@ def print_summary_table(results: dict) -> None:
         print(f"Total unique ads: {results['total_unique_ads']}")
     if results.get("total_r2_files") is not None:
         print(f"Total R2 files: {results['total_r2_files']:,}")
+    if results.get("total_r2_size_bytes") is not None:
+        print(f"Total R2 size: {format_size_bytes(results['total_r2_size_bytes'])}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1011,9 +1033,9 @@ def main() -> int:
             f"(source: {scraper_result['ads_source']})"
         )
 
-        scraper_result["r2_file_count"] = count_scraper_r2_files(
-            client, bucket, base_path
-        )
+        scraper_r2_usage = count_scraper_r2_usage(client, bucket, base_path)
+        scraper_result["r2_file_count"] = scraper_r2_usage.get("file_count", 0)
+        scraper_result["r2_size_bytes"] = scraper_r2_usage.get("size_bytes", 0)
 
         req_stats = count_scraper_request_metrics(
             client, bucket, base_path, target_date
@@ -1066,12 +1088,15 @@ def main() -> int:
 
     site_r2_prefix = (config.get("r2_prefix") or report_base).strip("/")
     if site_r2_prefix:
-        report["total_r2_files"] = count_site_r2_files(
-            client, bucket, site_r2_prefix
-        )
+        site_r2_usage = count_site_r2_usage(client, bucket, site_r2_prefix)
+        report["total_r2_files"] = site_r2_usage.get("file_count", 0)
+        report["total_r2_size_bytes"] = site_r2_usage.get("size_bytes", 0)
     else:
         report["total_r2_files"] = sum(
             r.get("r2_file_count") or 0 for r in report["scrapers"]
+        )
+        report["total_r2_size_bytes"] = sum(
+            r.get("r2_size_bytes") or 0 for r in report["scrapers"]
         )
 
     site_metrics = aggregate_site_request_metrics(report["scrapers"])
