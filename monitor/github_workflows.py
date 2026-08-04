@@ -41,6 +41,17 @@ _SCHEDULE_LOOKBACK_DAYS = {
 }
 
 
+_SITE_YML = Path(__file__).parent / "site.yml"
+
+
+def load_site_run_meta() -> Dict[str, Any]:
+    """Load site metadata from site.yml co-located with this module."""
+    if _SITE_YML.is_file():
+        with _SITE_YML.open(encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}
+    return {}
+
+
 def is_monitor_workflow(name: Optional[str]) -> bool:
     if not name:
         return False
