@@ -28,10 +28,10 @@ if _MONITOR_DIR not in sys.path:
 from ads_counter import count_scraper_ads
 from github_workflows import build_scraper_run_meta, load_site_run_meta
 from r2_file_counter import (
-    count_scraper_r2_daily_usage,
-    count_scraper_r2_usage,
-    count_site_r2_daily_usage,
-    count_site_r2_usage,
+    apply_type_bytes_fields,
+    count_scraper_r2_inventory_by_type,
+    count_site_r2_inventory_by_type,
+    sum_daily_r2_inventory_by_type,
 )
 from request_metrics import (
     aggregate_site_request_metrics,
@@ -1046,11 +1046,16 @@ def main() -> int:
             f"(source: {scraper_result['ads_source']})"
         )
 
-        scraper_r2_usage = count_scraper_r2_usage(client, bucket, base_path)
-        scraper_result["r2_file_count"] = scraper_r2_usage.get("file_count", 0)
-        scraper_result["r2_size_bytes"] = scraper_r2_usage.get("size_bytes", 0)
-        scraper_r2_daily_usage = count_scraper_r2_daily_usage(client, bucket, base_path, dates)
-        scraper_result["r2_daily_size"] = scraper_r2_daily_usage.get("size_bytes", 0)
+        scraper_r2_inventory = count_scraper_r2_inventory_by_type(client, bucket, base_path)
+        scraper_result["r2_file_count"] = scraper_r2_inventory.get("objects", 0)
+        scraper_result["r2_size_bytes"] = scraper_r2_inventory.get("size_bytes", 0)
+        apply_type_bytes_fields(scraper_result, scraper_r2_inventory, "r2")
+
+        scraper_daily_inventory = sum_daily_r2_inventory_by_type(
+            client, bucket, base_path, dates
+        )
+        scraper_result["r2_daily_size"] = scraper_daily_inventory.get("size_bytes", 0)
+        apply_type_bytes_fields(scraper_result, scraper_daily_inventory, "r2_daily")
 
         req_stats = count_scraper_request_metrics(
             client, bucket, base_path, target_date
@@ -1101,13 +1106,12 @@ def main() -> int:
         r.get("unique_ads") or 0 for r in report["scrapers"]
     )
 
-    site_r2_prefix = (config.get("r2_prefix") or report_base).strip("/")
+    site_r2_prefix = (config.get("r2_prefix") or "").strip("/")
     if site_r2_prefix:
-        site_r2_usage = count_site_r2_usage(client, bucket, site_r2_prefix)
-        report["total_r2_files"] = site_r2_usage.get("file_count", 0)
-        report["total_r2_size_bytes"] = site_r2_usage.get("size_bytes", 0)
-        site_r2_daily_usage = count_site_r2_daily_usage(client, bucket, site_r2_prefix, dates)
-        report["total_r2_daily_size"] = site_r2_daily_usage.get("size_bytes", 0)
+        site_r2_inventory = count_site_r2_inventory_by_type(client, bucket, site_r2_prefix)
+        report["total_r2_files"] = site_r2_inventory.get("objects", 0)
+        report["total_r2_size_bytes"] = site_r2_inventory.get("size_bytes", 0)
+        apply_type_bytes_fields(report, site_r2_inventory, "total_r2")
     else:
         report["total_r2_files"] = sum(
             r.get("r2_file_count") or 0 for r in report["scrapers"]
@@ -1115,8 +1119,31 @@ def main() -> int:
         report["total_r2_size_bytes"] = sum(
             r.get("r2_size_bytes") or 0 for r in report["scrapers"]
         )
-        report["total_r2_daily_size"] = sum(
-            r.get("r2_daily_size") or 0 for r in report["scrapers"]
+        for field_prefix, scraper_prefix in (
+            ("total_r2_images_bytes", "r2_images_bytes"),
+            ("total_r2_json_bytes", "r2_json_bytes"),
+            ("total_r2_excel_bytes", "r2_excel_bytes"),
+            ("total_r2_csv_bytes", "r2_csv_bytes"),
+            ("total_r2_parquet_bytes", "r2_parquet_bytes"),
+            ("total_r2_other_bytes", "r2_other_bytes"),
+        ):
+            report[field_prefix] = sum(
+                r.get(scraper_prefix) or 0 for r in report["scrapers"]
+            )
+
+    report["total_r2_daily_size"] = sum(
+        r.get("r2_daily_size") or 0 for r in report["scrapers"]
+    )
+    for field_prefix, scraper_prefix in (
+        ("total_r2_daily_images_bytes", "r2_daily_images_bytes"),
+        ("total_r2_daily_json_bytes", "r2_daily_json_bytes"),
+        ("total_r2_daily_excel_bytes", "r2_daily_excel_bytes"),
+        ("total_r2_daily_csv_bytes", "r2_daily_csv_bytes"),
+        ("total_r2_daily_parquet_bytes", "r2_daily_parquet_bytes"),
+        ("total_r2_daily_other_bytes", "r2_daily_other_bytes"),
+    ):
+        report[field_prefix] = sum(
+            r.get(scraper_prefix) or 0 for r in report["scrapers"]
         )
 
     site_metrics = aggregate_site_request_metrics(report["scrapers"])
