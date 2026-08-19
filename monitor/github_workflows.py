@@ -197,12 +197,100 @@ def _parse_github_dt(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _run_duration_sec(run: Dict) -> int:
-    started = _parse_github_dt(run.get("run_started_at"))
+def _read_github_event() -> Dict[str, Any]:
+    event_path = (os.environ.get("GITHUB_EVENT_PATH") or "").strip()
+    if not event_path:
+        return {}
+    try:
+        with Path(event_path).open(encoding="utf-8") as fh:
+            payload = json.load(fh)
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _enrich_site_from_github_env(site: Dict) -> None:
+    """Fill repo owner/name and triggering workflow from the Actions environment."""
+    repo = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+    if repo and "/" in repo:
+        owner, repo_name = repo.split("/", 1)
+        if not (site.get("github_username") or site.get("github_owner")):
+            site["github_username"] = owner
+        if not site.get("repo"):
+            site["repo"] = repo_name
+
+    if site.get("workflows") or site.get("workflow_name"):
+        return
+    if os.environ.get("GITHUB_EVENT_NAME") != "workflow_run":
+        return
+    name = ((_read_github_event().get("workflow_run") or {}).get("name") or "").strip()
+    if name and not is_monitor_workflow(name):
+        site["workflow_name"] = name
+
+
+def _run_duration_sec(run: Dict) -> Optional[int]:
+    started = _parse_github_dt(run.get("run_started_at")) or _parse_github_dt(run.get("created_at"))
     finished = _parse_github_dt(run.get("updated_at"))
     if started and finished:
         return max(0, int((finished - started).total_seconds()))
-    return 0
+    return None
+
+
+def _conclusion_to_status(conclusion: Optional[str], status: Optional[str] = None) -> Optional[str]:
+    if status and status != "completed":
+        return None
+    if conclusion in (None, "cancelled"):
+        return None
+    if conclusion in ("success", "skipped"):
+        return "success"
+    return "failure"
+
+
+def _meta_from_triggering_workflow_run(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build pipeline metadata from a workflow_run trigger payload."""
+    if os.environ.get("GITHUB_EVENT_NAME") != "workflow_run":
+        return None
+    run = event.get("workflow_run")
+    if not isinstance(run, dict):
+        return None
+
+    name = (run.get("name") or run.get("display_title") or "").strip()
+    if not name or is_monitor_workflow(name):
+        return None
+
+    repo_obj = run.get("repository") if isinstance(run.get("repository"), dict) else {}
+    repo_full = (repo_obj.get("full_name") or os.environ.get("GITHUB_REPOSITORY") or "").strip()
+    owner, repo_name = ("", "")
+    if repo_full and "/" in repo_full:
+        owner, repo_name = repo_full.split("/", 1)
+
+    duration_sec = _run_duration_sec(run)
+    detail: Dict[str, Any] = {
+        "name": name,
+        "run_id": run.get("id"),
+        "run_number": run.get("run_number"),
+        "conclusion": run.get("conclusion"),
+        "status": run.get("status"),
+        "duration_sec": duration_sec,
+        "run_started_at": run.get("run_started_at"),
+        "updated_at": run.get("updated_at"),
+        "html_url": run.get("html_url"),
+    }
+    if owner and repo_name:
+        detail["owner"] = owner
+        detail["repo"] = repo_name
+
+    return {
+        "run_place": "github",
+        "workflow_name": name,
+        "workflow_status": _conclusion_to_status(run.get("conclusion"), run.get("status")),
+        "duration_sec": duration_sec,
+        "workflow_run_id": str(run["id"]) if run.get("id") else None,
+        "workflow_run_number": run.get("run_number"),
+        "github_repository": repo_full or None,
+        "workflows": [detail],
+        "source": "github_event",
+    }
 
 
 def _workflow_name_map(owner: str, repo: str, token: str) -> Dict[str, int]:
@@ -345,7 +433,8 @@ def build_scraper_run_meta(
     Prefers scraper pipeline runs from GitHub API; never labels the monitor workflow
     as the site's primary workflow.
     """
-    pipeline = fetch_pipeline_github_meta(site, partition_date)
+    site = dict(site)
+    _enrich_site_from_github_env(site)
 
     monitor_meta: Dict[str, Any] = {
         "run_place": (site.get("run_place") or "github").strip().lower(),
@@ -362,13 +451,21 @@ def build_scraper_run_meta(
             "github_repository": os.environ.get("GITHUB_REPOSITORY", ""),
         })
 
-    if pipeline:
-        result = dict(pipeline)
-        result["monitor_run"] = monitor_meta
+    def _attach_monitor_meta(result: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(result)
+        out["monitor_run"] = monitor_meta
         github_gmail = (site.get("github_gmail") or site.get("github_email") or "").strip()
         if github_gmail:
-            result["github_gmail"] = github_gmail
-        return result
+            out["github_gmail"] = github_gmail
+        return out
+
+    event_meta = _meta_from_triggering_workflow_run(_read_github_event())
+    if event_meta:
+        return _attach_monitor_meta(event_meta)
+
+    pipeline = fetch_pipeline_github_meta(site, partition_date)
+    if pipeline:
+        return _attach_monitor_meta(pipeline)
 
     configured = resolve_workflow_names(site)
     fallback_name = format_workflow_label(configured) if configured else None
@@ -383,10 +480,6 @@ def build_scraper_run_meta(
         "workflow_name": fallback_name or "—",
         "workflow_status": None,
         "duration_sec": None,
-        "monitor_run": monitor_meta,
         "source": "registry_fallback",
     }
-    github_gmail = (site.get("github_gmail") or site.get("github_email") or "").strip()
-    if github_gmail:
-        result["github_gmail"] = github_gmail
-    return result
+    return _attach_monitor_meta(result)
