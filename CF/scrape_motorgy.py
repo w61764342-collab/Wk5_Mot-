@@ -4,6 +4,7 @@ import os
 import re
 import time
 from datetime import datetime
+from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -12,9 +13,11 @@ import pandas as pd
 import requests
 from botocore.config import Config
 from bs4 import BeautifulSoup
+from PIL import Image
 
 BASE_URL = "https://www.motorgy.com"
 USED_CARS_URL = "https://www.motorgy.com/ar/used-cars"
+WEBP_QUALITY = 50
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -296,10 +299,17 @@ def parse_ad_id(url: str) -> str:
     return re.sub(r"\D", "", last) or last
 
 
-def file_extension_from_url(url: str) -> str:
-    path = urlparse(url).path
-    ext = os.path.splitext(path)[1]
-    return ext if ext else ".jpg"
+def convert_image_to_webp(content: bytes, quality: int = WEBP_QUALITY) -> bytes:
+    with Image.open(BytesIO(content)) as img:
+        if getattr(img, "n_frames", 1) > 1:
+            img.seek(0)
+        if img.mode == "P":
+            img = img.convert("RGBA" if "transparency" in img.info else "RGB")
+        elif img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        buffer = BytesIO()
+        img.save(buffer, format="WEBP", quality=quality, method=6)
+        return buffer.getvalue()
 
 
 def slugify_column(text: str) -> str:
@@ -315,7 +325,7 @@ def download_image(session: requests.Session, url: str) -> bytes:
     return resp.content
 
 
-def upload_bytes_to_r2(r2_client, bucket: str, key: str, content: bytes, content_type: str = "image/jpeg"):
+def upload_bytes_to_r2(r2_client, bucket: str, key: str, content: bytes, content_type: str = "image/webp"):
     r2_client.put_object(Bucket=bucket, Key=key, Body=content, ContentType=content_type)
 
 
@@ -501,14 +511,10 @@ def scrape_all() -> None:
         r2_image_paths = []
         for img_index, img_url in enumerate(image_urls, start=1):
             try:
-                ext = file_extension_from_url(img_url)
-                filename = f"{img_index:02d}{ext}"
+                filename = f"{img_index:02d}.webp"
                 key = f"{r2_prefix}/images/{ad_id}/{filename}"
-                content = download_image(session, img_url)
-                content_type = "image/jpeg"
-                if ext.lower() in {".png"}:
-                    content_type = "image/png"
-                upload_bytes_to_r2(r2_client, bucket, key, content, content_type)
+                content = convert_image_to_webp(download_image(session, img_url))
+                upload_bytes_to_r2(r2_client, bucket, key, content, "image/webp")
                 r2_image_paths.append(f"r2://{bucket}/{key}")
             except Exception as exc:
                 logger.warning("Image upload failed (%s): %s", img_url, exc)
