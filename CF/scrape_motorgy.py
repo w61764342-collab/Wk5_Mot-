@@ -4,7 +4,6 @@ import os
 import re
 import time
 from datetime import datetime
-from io import BytesIO
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -13,11 +12,9 @@ import pandas as pd
 import requests
 from botocore.config import Config
 from bs4 import BeautifulSoup
-from PIL import Image
 
 BASE_URL = "https://www.motorgy.com"
 USED_CARS_URL = "https://www.motorgy.com/ar/used-cars"
-WEBP_QUALITY = 50
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -299,34 +296,11 @@ def parse_ad_id(url: str) -> str:
     return re.sub(r"\D", "", last) or last
 
 
-def convert_image_to_webp(content: bytes, quality: int = WEBP_QUALITY) -> bytes:
-    with Image.open(BytesIO(content)) as img:
-        if getattr(img, "n_frames", 1) > 1:
-            img.seek(0)
-        if img.mode == "P":
-            img = img.convert("RGBA" if "transparency" in img.info else "RGB")
-        elif img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGB")
-        buffer = BytesIO()
-        img.save(buffer, format="WEBP", quality=quality, method=6)
-        return buffer.getvalue()
-
-
 def slugify_column(text: str) -> str:
     text = normalize_text(text)
     text = re.sub(r"[\s/]+", "_", text)
     text = re.sub(r"[^\w\u0600-\u06FF_]+", "", text, flags=re.UNICODE)
     return text.strip("_")
-
-
-def download_image(session: requests.Session, url: str) -> bytes:
-    resp = session.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.content
-
-
-def upload_bytes_to_r2(r2_client, bucket: str, key: str, content: bytes, content_type: str = "image/webp"):
-    r2_client.put_object(Bucket=bucket, Key=key, Body=content, ContentType=content_type)
 
 
 def scrape_detail(session: requests.Session, url: str) -> Dict[str, object]:
@@ -508,19 +482,6 @@ def scrape_all() -> None:
             continue
         image_urls = data.pop("image_urls", [])
 
-        r2_image_paths = []
-        for img_index, img_url in enumerate(image_urls, start=1):
-            try:
-                filename = f"{img_index:02d}.webp"
-                key = f"{r2_prefix}/images/{ad_id}/{filename}"
-                content = convert_image_to_webp(download_image(session, img_url))
-                upload_bytes_to_r2(r2_client, bucket, key, content, "image/webp")
-                r2_image_paths.append(f"r2://{bucket}/{key}")
-            except Exception as exc:
-                logger.warning("Image upload failed (%s): %s", img_url, exc)
-                session.record_failure(f"ad {ad_id} image", str(exc))
-                continue
-
         row = {
             "ad_id": ad_id,
             "detail_url": detail_url,
@@ -528,8 +489,9 @@ def scrape_all() -> None:
             "specs_json": json.dumps(data.get("specs", {}), ensure_ascii=False),
             "features_json": json.dumps(data.get("features", {}), ensure_ascii=False),
             "inspection_report_json": json.dumps(data.get("inspection_report", {}), ensure_ascii=False),
-            "r2_images_paths": json.dumps(r2_image_paths, ensure_ascii=False),
-            "images_count": len(r2_image_paths),
+            "image_urls_json": json.dumps(image_urls, ensure_ascii=False),
+            "r2_images_paths": json.dumps([], ensure_ascii=False),
+            "images_count": len(image_urls),
         }
 
         inspection_report = data.get("inspection_report", {}) or {}
