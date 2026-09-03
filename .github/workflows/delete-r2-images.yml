@@ -1,0 +1,81 @@
+name: Delete Motorgy R2 Images
+
+# Purges historical scrape images under motorgy/**/images/** in Cloudflare R2.
+# Excel, JSON, and monitor objects are never touched.
+# Default is dry-run. Set execute=true AND confirm=DELETE to delete for real.
+
+on:
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: "Actually delete images (false = dry-run listing only)"
+        required: true
+        type: boolean
+        default: false
+      confirm:
+        description: 'Type DELETE to confirm real deletion (ignored when execute=false)'
+        required: false
+        type: string
+        default: ""
+      site_prefix:
+        description: "Site R2 prefix"
+        required: true
+        type: string
+        default: "motorgy"
+      year:
+        description: "Optional year filter (YYYY). Leave empty for all years."
+        required: false
+        type: string
+        default: ""
+      month:
+        description: "Optional month filter (MM). Requires year."
+        required: false
+        type: string
+        default: ""
+      day:
+        description: "Optional day filter (DD). Requires year and month."
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  delete-r2-images:
+    runs-on: ubuntu-latest
+    env:
+      CF_R2_BUCKET_NAME: ${{ secrets.CF_R2_BUCKET_NAME }}
+      CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+      CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+      CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+      SITE_PREFIX: ${{ inputs.site_prefix }}
+      YEAR: ${{ inputs.year }}
+      MONTH: ${{ inputs.month }}
+      DAY: ${{ inputs.day }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install boto3 botocore
+
+      - name: Validate confirmation for real delete
+        if: ${{ inputs.execute }}
+        run: |
+          if [ "${{ inputs.confirm }}" != "DELETE" ]; then
+            echo "::error::execute=true requires confirm=DELETE. Aborting."
+            exit 1
+          fi
+          echo "Confirmation accepted — proceeding with real deletion."
+
+      - name: Dry-run list Motorgy R2 images
+        if: ${{ !inputs.execute }}
+        run: python CF/delete_r2_images.py --sample 50
+
+      - name: Delete Motorgy R2 images
+        if: ${{ inputs.execute }}
+        run: python CF/delete_r2_images.py --execute --sample 50
