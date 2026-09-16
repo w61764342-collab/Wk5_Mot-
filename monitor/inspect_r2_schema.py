@@ -44,6 +44,8 @@ MONITOR_STATS_KEY = "monitor/monitor_stats.yml"
 CONFIG_KEY = "monitor/websites-config.yml"
 DEFAULT_CONFIG_BASE = "motorgy"
 DEFAULT_DYNAMIC_COLUMN_PATTERNS = ["inspection_*__*"]
+# Present in older Excel exports after images were dropped; do not fail schema checks.
+DEFAULT_IGNORED_COLUMNS = ["image_urls_json"]
 
 
 def json_safe(value: Any) -> Any:
@@ -157,21 +159,30 @@ def classify_columns(
     required = sheet_schema.get("required_columns", [])
     required_set = set(required)
     patterns = sheet_schema.get("dynamic_column_patterns", DEFAULT_DYNAMIC_COLUMN_PATTERNS)
+    ignored_set = set(sheet_schema.get("ignored_columns", DEFAULT_IGNORED_COLUMNS))
     actual = list(columns)
 
     dynamic = [
         col
         for col in actual
         if col not in required_set
+        and col not in ignored_set
         and any(fnmatch.fnmatch(col, pattern) for pattern in patterns)
     ]
     dynamic_set = set(dynamic)
-    unknown = [col for col in actual if col not in required_set and col not in dynamic_set]
+    unknown = [
+        col
+        for col in actual
+        if col not in required_set and col not in dynamic_set and col not in ignored_set
+    ]
     missing_required = [col for col in required if col not in actual]
+    ignored = [col for col in actual if col in ignored_set]
 
     union_set = set(known_union or [])
     required_in_union = [col for col in union_set if col in required_set]
-    new_columns = [col for col in actual if union_set and col not in union_set]
+    new_columns = [
+        col for col in actual if union_set and col not in union_set and col not in ignored_set
+    ]
     dropped_from_union = (
         [col for col in required_in_union if col not in actual] if required_in_union else []
     )
@@ -184,6 +195,7 @@ def classify_columns(
         "required_columns": sorted(required_set & set(actual)),
         "missing_required": sorted(missing_required),
         "dynamic_columns": sorted(dynamic),
+        "ignored_columns": sorted(ignored),
         "unknown_columns": sorted(unknown),
         "new_columns": sorted(new_columns),
         "dropped_from_union": sorted(dropped_from_union),
@@ -226,6 +238,11 @@ def validate_column_schema(
                 else (
                     f"Column schema OK — {schema['required_count']} required, "
                     f"{schema['dynamic_count']} dynamic ({', '.join(patterns)})"
+                    + (
+                        f"; ignored {schema['ignored_columns']}"
+                        if schema.get("ignored_columns")
+                        else ""
+                    )
                 )
             ),
             "severity": "high",
@@ -627,6 +644,8 @@ def print_column_schema_report(scraper_name: str, scraper_result: dict) -> None:
             dynamic_preview = sheet_summary["dynamic_columns"][:5]
             suffix = " ..." if len(sheet_summary["dynamic_columns"]) > 5 else ""
             print(f"    Dynamic columns: {', '.join(dynamic_preview)}{suffix}")
+        if sheet_summary.get("ignored_columns"):
+            print(f"    Ignored: {sheet_summary['ignored_columns']}")
         if sheet_summary.get("unknown_columns"):
             print(f"    Unexpected: {sheet_summary['unknown_columns']}")
         if sheet_summary.get("new_columns"):
