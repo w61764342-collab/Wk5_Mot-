@@ -16,7 +16,6 @@ import sys
 from typing import Iterable, List, Optional, Tuple
 
 import boto3
-from botocore.config import Config
 
 DEFAULT_SITE_PREFIX = "motorgy"
 IMAGE_EXTENSIONS = {
@@ -34,6 +33,8 @@ DELETE_BATCH_SIZE = 1000
 
 def get_env(name: str, fallback: Optional[str] = None) -> str:
     value = os.getenv(name) or (os.getenv(fallback) if fallback else None)
+    if value:
+        value = value.strip()
     if not value:
         names = name if not fallback else f"{name} (or {fallback})"
         raise RuntimeError(f"Missing required environment variable: {names}")
@@ -41,12 +42,16 @@ def get_env(name: str, fallback: Optional[str] = None) -> str:
 
 
 def build_s3_client():
+    # Match src/scrape_motorgy.py. An empty AWS_REGION env (common when a
+    # missing GitHub secret interpolates to "") can break SigV4 signing.
+    for key in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        if not (os.getenv(key) or "").strip():
+            os.environ.pop(key, None)
     return boto3.client(
         "s3",
         aws_access_key_id=get_env("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=get_env("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1",
-        config=Config(signature_version="s3v4"),
+        region_name="us-east-1",
     )
 
 
