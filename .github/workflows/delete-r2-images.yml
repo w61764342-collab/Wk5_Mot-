@@ -8,15 +8,15 @@ on:
   workflow_dispatch:
     inputs:
       execute:
-        description: "Actually delete images (false = dry-run listing only)"
+        description: "Check this to delete (also type DELETE in confirm below)"
         required: true
         type: boolean
         default: false
       confirm:
-        description: 'Type DELETE to confirm real deletion (ignored when execute=false)'
-        required: false
+        description: "Must be exactly DELETE (all caps) when execute is checked"
+        required: true
         type: string
-        default: ""
+        default: "dry-run"
       site_prefix:
         description: "Site R2 prefix"
         required: true
@@ -65,9 +65,12 @@ jobs:
 
       - name: Validate confirmation for real delete
         if: ${{ inputs.execute }}
+        env:
+          CONFIRM: ${{ github.event.inputs.confirm }}
         run: |
-          if [ "${{ inputs.confirm }}" != "DELETE" ]; then
-            echo "::error::execute=true requires confirm=DELETE. Aborting."
+          CONFIRM_TRIMMED="$(printf '%s' "$CONFIRM" | tr -d '[:space:]')"
+          if [ "$CONFIRM_TRIMMED" != "DELETE" ]; then
+            echo "::error::execute=true requires the confirm input to be exactly DELETE (got: '${CONFIRM_TRIMMED}'). Aborting."
             exit 1
           fi
           echo "Confirmation accepted — proceeding with real deletion."
