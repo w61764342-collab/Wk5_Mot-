@@ -61,7 +61,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install boto3 botocore
+        run: pip install boto3==1.34.145 botocore==1.34.145
 
       - name: Validate confirmation for real delete
         if: ${{ inputs.execute }}
